@@ -20,7 +20,7 @@ if(USE_PSITRI)
   # Silkworm expects a target named "mdbx-static"
   add_library(mdbx-static ALIAS psitrimdbx)
 
-  target_compile_definitions(psitrimdbx PUBLIC CONSTEXPR_ASSERT=assert)
+  target_compile_definitions(psitrimdbx PUBLIC CONSTEXPR_ASSERT=assert USE_PSITRI=1)
 
 else()
   # ── Native libmdbx backend (default) ───────────────────────────────

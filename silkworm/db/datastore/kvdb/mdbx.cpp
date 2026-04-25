@@ -296,7 +296,17 @@ PooledCursor& PooledCursor::operator=(PooledCursor&& other) noexcept {
 
 PooledCursor::~PooledCursor() {
     if (handle_) {
+#ifdef USE_PSITRI
+        // psitri's owned_merge_cursor holds a thread-local read session
+        // by raw reference; the session's TLS slot is destroyed before
+        // the cursor handles_pool_ TLS slot, so cursors left in the pool
+        // dereference freed memory during the pool's own destructor at
+        // thread-exit. Close immediately instead of pooling.
+        ::mdbx_cursor_close(handle_);
+        handle_ = nullptr;
+#else
         handles_pool_.add(handle_);
+#endif
     }
 }
 
