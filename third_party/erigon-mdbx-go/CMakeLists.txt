@@ -1,43 +1,58 @@
 # Copyright 2025 The Silkworm Authors
 # SPDX-License-Identifier: Apache-2.0
 
-set(MDBX_ENABLE_TESTS OFF)
+option(USE_PSITRI "Use PsiTri (psitrimdbx) instead of native libmdbx" OFF)
 
-# reduce the log verbosity of mdbx-go/mdbxdist/CMakeLists.txt
-if(NOT CMAKE_MESSAGE_LOG_LEVEL)
-  set(CMAKE_MESSAGE_LOG_LEVEL_EMPTY YES)
-  set(CMAKE_MESSAGE_LOG_LEVEL NOTICE)
-endif()
+if(USE_PSITRI)
+  # ── PsiTri backend ─────────────────────────────────────────────────
+  # Build the full psitri library tree (sal, hash, ucc, art, psitri core),
+  # then add psitrimdbx on top. The top-level CMakeLists auto-detects
+  # PSITRI_AS_SUBDIRECTORY and skips project()/wrapper libs.
 
-add_subdirectory(mdbx-go/mdbxdist)
+  set(PSITRI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../psitri")
 
-# restore the log verbosity
-if(CMAKE_MESSAGE_LOG_LEVEL_EMPTY)
-  unset(CMAKE_MESSAGE_LOG_LEVEL)
-endif()
+  # Build core psitri (sets up sal, hash, ucc, art, psitri targets)
+  add_subdirectory("${PSITRI_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/psitri")
 
-target_compile_definitions(mdbx-static PUBLIC CONSTEXPR_ASSERT=assert)
+  # Build psitrimdbx (the MDBX-compatible shim)
+  add_subdirectory("${PSITRI_DIR}/libraries/psitrimdbx" "${CMAKE_CURRENT_BINARY_DIR}/psitrimdbx")
 
-# mdbx is not compatible with TSAN and added to the suppressions config file let's suppress the related compilation
-# warnings
-if(SILKWORM_SANITIZE STREQUAL "thread" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-  target_compile_options(mdbx-static PRIVATE -Wno-tsan)
-endif()
+  # Silkworm expects a target named "mdbx-static"
+  add_library(mdbx-static ALIAS psitrimdbx)
 
-if(MDBX_BUILD_TOOLS)
-  foreach(
-    TOOL
-    mdbx_chk
-    mdbx_copy
-    mdbx_stat
-    mdbx_dump
-    mdbx_load
-    mdbx_drop
-  )
+  target_compile_definitions(psitrimdbx PUBLIC CONSTEXPR_ASSERT=assert)
 
-    if((CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang") AND (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15))
-      # https://stackoverflow.com/questions/77164140/
-      target_link_options(${TOOL} PRIVATE -Wl,-no_warn_duplicate_libraries)
-    endif()
-  endforeach()
+else()
+  # ── Native libmdbx backend (default) ───────────────────────────────
+
+  set(MDBX_ENABLE_TESTS OFF)
+
+  if(NOT CMAKE_MESSAGE_LOG_LEVEL)
+    set(CMAKE_MESSAGE_LOG_LEVEL_EMPTY YES)
+    set(CMAKE_MESSAGE_LOG_LEVEL NOTICE)
+  endif()
+
+  add_subdirectory(mdbx-go/mdbxdist)
+
+  if(CMAKE_MESSAGE_LOG_LEVEL_EMPTY)
+    unset(CMAKE_MESSAGE_LOG_LEVEL)
+  endif()
+
+  target_compile_definitions(mdbx-static PUBLIC CONSTEXPR_ASSERT=assert)
+
+  if(SILKWORM_SANITIZE STREQUAL "thread" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    target_compile_options(mdbx-static PRIVATE -Wno-tsan)
+  endif()
+
+  if(MDBX_BUILD_TOOLS)
+    foreach(
+      TOOL
+      mdbx_chk mdbx_copy mdbx_stat mdbx_dump mdbx_load mdbx_drop
+    )
+      if((CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang") AND (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15))
+        target_link_options(${TOOL} PRIVATE -Wl,-no_warn_duplicate_libraries)
+      endif()
+    endforeach()
+  endif()
+
 endif()

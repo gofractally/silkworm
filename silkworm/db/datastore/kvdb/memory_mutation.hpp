@@ -91,8 +91,8 @@ class MemoryMutation : public RWTxnManaged {
     std::unique_ptr<MemoryMutationCursor> make_cursor(const MapConfig& config);
 
     MemoryOverlay& overlay_;
-    std::map<std::string, std::map<Slice, bool>> deleted_entries_;
-    std::map<std::string, std::map<Slice, std::map<Slice, bool>>> deleted_dups_;
+    std::map<std::string, std::map<std::string, bool>> deleted_entries_;
+    std::map<std::string, std::map<std::string, std::map<std::string, bool>>> deleted_dups_;
     std::map<std::string, bool> cleared_tables_;
 };
 

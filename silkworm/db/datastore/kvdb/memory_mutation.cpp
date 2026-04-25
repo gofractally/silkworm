@@ -88,7 +88,8 @@ bool MemoryMutation::is_entry_deleted(std::string_view table_view, const Slice& 
         return false;
     }
     const auto& deleted_slices = deleted_entries_.at(table);
-    return deleted_slices.find(key) != deleted_slices.cend();
+    std::string key_str{static_cast<const char*>(key.data()), key.length()};
+    return deleted_slices.find(key_str) != deleted_slices.cend();
 }
 
 bool MemoryMutation::is_dup_deleted(std::string_view table, const Slice& key, const Slice& value) const {
@@ -97,12 +98,14 @@ bool MemoryMutation::is_dup_deleted(std::string_view table, const Slice& key, co
         return false;
     }
 
-    auto const deleted_key = deleted_table->second.find(key);
+    std::string key_str{static_cast<const char*>(key.data()), key.length()};
+    auto const deleted_key = deleted_table->second.find(key_str);
     if (deleted_key == deleted_table->second.end()) {
         return false;
     }
 
-    auto const deleted_value = deleted_key->second.find(value);
+    std::string val_str{static_cast<const char*>(value.data()), value.length()};
+    auto const deleted_value = deleted_key->second.find(val_str);
     return deleted_value != deleted_key->second.end();
 }
 
@@ -131,25 +134,30 @@ std::unique_ptr<RWCursorDupSort> MemoryMutation::rw_cursor_dup_sort(const MapCon
 }
 
 bool MemoryMutation::erase(const MapConfig& config, const Slice& key) {
-    deleted_entries_[config.name_str()][key] = true;
+    std::string key_str{static_cast<const char*>(key.data()), key.length()};
+    deleted_entries_[config.name_str()][key_str] = true;
     const auto handle{managed_txn_.open_map(config.name_str(), config.key_mode, config.value_mode)};
     return managed_txn_.erase(handle, key);
 }
 
 bool MemoryMutation::erase(const MapConfig& config, const Slice& key, const Slice& value) {
-    deleted_dups_[config.name_str()][key][value] = true;
+    std::string key_str{static_cast<const char*>(key.data()), key.length()};
+    std::string val_str{static_cast<const char*>(value.data()), value.length()};
+    deleted_dups_[config.name_str()][key_str][val_str] = true;
     const auto handle{managed_txn_.open_map(config.name_str(), config.key_mode, config.value_mode)};
     return managed_txn_.erase(handle, key, value);
 }
 
 void MemoryMutation::upsert(const MapConfig& config, const Slice& key, const Slice& value) {
+    std::string key_str{static_cast<const char*>(key.data()), key.length()};
+    std::string val_str{static_cast<const char*>(value.data()), value.length()};
     if (static_cast<MDBX_db_flags_t>(config.value_mode) & MDBX_db_flags_t::MDBX_DUPSORT) {
         if (is_dup_deleted(config.name, key, value)) {
-            deleted_dups_[config.name_str()][key].erase(value);
+            deleted_dups_[config.name_str()][key_str].erase(val_str);
         }
     } else {
         if (is_entry_deleted(config.name_str(), key)) {
-            deleted_entries_[config.name_str()].erase(key);
+            deleted_entries_[config.name_str()].erase(key_str);
         }
     }
 
@@ -180,7 +188,7 @@ void MemoryMutation::flush(RWTxn& rw_txn) {
         }
         const auto map_handle = open_map(rw_txn, *table_config);
         for (const auto& [key, _] : keys) {
-            rw_txn->erase(map_handle, key);
+            rw_txn->erase(map_handle, Slice{key});
         }
     }
 
@@ -194,7 +202,7 @@ void MemoryMutation::flush(RWTxn& rw_txn) {
         const auto map_handle = open_map(rw_txn, *table_config);
         for (const auto& [key, vals] : keys) {
             for (const auto& [val, _] : vals) {
-                rw_txn->erase(map_handle, key, val);
+                rw_txn->erase(map_handle, Slice{key}, Slice{val});
             }
         }
     }

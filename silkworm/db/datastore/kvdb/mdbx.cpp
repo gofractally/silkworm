@@ -109,7 +109,7 @@ static mdbx::cursor::move_operation move_operation(CursorMoveDirection direction
     uint32_t flags{MDBX_NOTLS | MDBX_NORDAHEAD | MDBX_COALESCE | MDBX_SYNC_DURABLE};  // Default flags
 
     if (config.read_ahead) {
-        flags &= ~MDBX_NORDAHEAD;
+        flags &= ~static_cast<uint32_t>(MDBX_NORDAHEAD);
     }
     if (config.exclusive && config.shared) {
         throw std::runtime_error("Exclusive conflicts with Shared");
@@ -562,7 +562,7 @@ bool has_map(::mdbx::txn& tx, std::string_view map_name) {
     try {
         ::mdbx::map_handle main_map{1};
         auto main_cursor{tx.open_cursor(main_map)};
-        auto found{main_cursor.seek(::mdbx::slice(map_name))};
+        auto found{main_cursor.find(::mdbx::slice(map_name), false)};
         return found;
     } catch (const std::exception&) {
         return false;

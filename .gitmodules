@@ -52,3 +52,6 @@
 [submodule "BlockchainTests"]
 	path = third_party/eest-fixtures/BlockchainTests
 	url = https://github.com/erigontech/eest-fixtures
+[submodule "third_party/psitri"]
+	path = third_party/psitri
+	url = git@github.com:gofractally/arbtrie.git

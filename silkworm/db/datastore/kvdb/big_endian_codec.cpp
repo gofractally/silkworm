@@ -15,7 +15,7 @@ Slice BigEndianU64Codec::encode() {
 
 void BigEndianU64Codec::decode(Slice slice) {
     SILKWORM_ASSERT(slice.size() >= sizeof(uint64_t));
-    value = endian::load_big_u64(static_cast<uint8_t*>(slice.data()));
+    value = endian::load_big_u64(static_cast<const uint8_t*>(slice.data()));
 }
 
 }  // namespace silkworm::datastore::kvdb

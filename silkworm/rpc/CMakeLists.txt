@@ -48,6 +48,9 @@ silkworm_library(
   PRIVATE ${SILKWORM_RPCDAEMON_PRIVATE_LIBRARIES}
 )
 
+# Suppress C++23 deprecation warnings from Boost.Beast headers
+target_compile_options(silkworm_rpcdaemon PRIVATE -Wno-deprecated-declarations)
+
 # silkworm_rpcdaemon_cli depends on silkworm_rpcdaemon
 add_subdirectory(cli)
 
