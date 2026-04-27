@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
@@ -205,6 +206,8 @@ class ROTxn {
     virtual bool is_open() const { return txn_ref_.txn::operator bool(); }
     virtual mdbx::env db() const { return txn_ref_.env(); }
 
+    ::mdbx::map_handle cached_map(const MapConfig& config);
+
     virtual std::unique_ptr<ROCursor> ro_cursor(const MapConfig& config);
     virtual std::unique_ptr<ROCursorDupSort> ro_cursor_dup_sort(const MapConfig& config);
 
@@ -214,7 +217,13 @@ class ROTxn {
     explicit ROTxn(::mdbx::txn& txn_ref) : txn_ref_{txn_ref} {}
 
   private:
+    struct CachedMap {
+        std::string name;
+        ::mdbx::map_handle handle;
+    };
+
     ::mdbx::txn& txn_ref_;
+    std::vector<CachedMap> map_cache_;
 };
 
 //! \brief ROTxnManaged wraps a *managed* read-only transaction, which means the underlying transaction lifecycle
@@ -398,6 +407,7 @@ struct EnvUnmanaged : public ::mdbx::env {
 //! \param [in] config : the configuration settings for the underlying map
 //! \return A handle to the opened cursor
 ::mdbx::cursor_managed open_cursor(::mdbx::txn& tx, const MapConfig& config);
+::mdbx::cursor_managed open_cursor(ROTxn& tx, const MapConfig& config);
 
 //! \brief Computes the max size of single-value data to fit into a leaf data page
 //! \param [in] page_size : the actually configured MDBX page size
@@ -417,7 +427,7 @@ class PooledCursor : public RWCursorDupSort, protected ::mdbx::cursor {
     explicit PooledCursor();
     explicit PooledCursor(ROTxn& txn, ::mdbx::map_handle map);
     explicit PooledCursor(::mdbx::txn& txn, const MapConfig& config);
-    explicit PooledCursor(ROTxn& txn, const MapConfig& config) : PooledCursor(*txn, config) {}
+    explicit PooledCursor(ROTxn& txn, const MapConfig& config);
     ~PooledCursor() override;
 
     PooledCursor(PooledCursor&& other) noexcept;
@@ -432,7 +442,7 @@ class PooledCursor : public RWCursorDupSort, protected ::mdbx::cursor {
     //! \brief Reuse current cursor binding it to provided transaction and map configuration
     void bind(::mdbx::txn& txn, const MapConfig& config);
 
-    void bind(ROTxn& txn, const MapConfig& config) override { bind(*txn, config); }
+    void bind(ROTxn& txn, const MapConfig& config) override;
 
     std::unique_ptr<ROCursor> clone() override;
 

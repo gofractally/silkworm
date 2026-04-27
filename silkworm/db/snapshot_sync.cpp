@@ -12,6 +12,7 @@
 #include <gsl/util>
 #include <magic_enum.hpp>
 
+#include <silkworm/core/rlp/encode.hpp>
 #include <silkworm/core/types/hash.hpp>
 #include <silkworm/infra/common/ensure.hpp>
 #include <silkworm/infra/common/environment.hpp>
@@ -29,6 +30,7 @@
 
 namespace silkworm::db {
 
+using datastore::kvdb::to_slice;
 using namespace silkworm::snapshots;
 
 //! \warning Hash provider for std::filesystem::path necessary to avoid the following error in Clang + LLVM 16
@@ -337,6 +339,8 @@ void SnapshotSync::update_block_headers(RWTxn& txn, BlockNum max_block_available
 
     // Iterate on block header snapshots and write header-related tables
     datastore::kvdb::Collector hash_to_block_num_collector;
+    auto difficulty_cursor = txn.rw_cursor(table::kDifficulty);
+    auto canonical_hashes_cursor = txn.rw_cursor(table::kCanonicalHashes);
     intx::uint256 total_difficulty{0};
     uint64_t block_count{0};
 
@@ -351,10 +355,14 @@ void SnapshotSync::update_block_headers(RWTxn& txn, BlockNum max_block_available
 
             // Write block header into kDifficulty table
             total_difficulty += header.difficulty;
-            write_total_difficulty(txn, block_num, block_hash, total_difficulty);
+            Bytes difficulty_key{block_key(block_num, block_hash.bytes)};
+            Bytes difficulty_value;
+            rlp::encode(difficulty_value, total_difficulty);
+            difficulty_cursor->upsert(to_slice(difficulty_key), to_slice(difficulty_value));
 
             // Write block header into kCanonicalHashes table
-            write_canonical_hash(txn, block_num, block_hash);
+            Bytes canonical_hash_key{block_key(block_num)};
+            canonical_hashes_cursor->upsert(to_slice(canonical_hash_key), to_slice(block_hash));
 
             // Collect entries for later loading kHeaderNumbers table
             Bytes block_hash_bytes{block_hash.bytes, kHashLength};

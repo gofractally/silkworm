@@ -266,7 +266,9 @@ Stage::Result Execution::execute_batch(RWTxn& txn, BlockNum max_block_num, Analy
         // update block_num_ to point to the last successfully executed block
         --block_num_;
 
-        SILK_TRACE_M(log_prefix_, {"buffer", "state", "size", human_size(buffer.current_batch_state_size())});
+        SILK_TRACE_M(log_prefix_, {"buffer", "state", "size", human_size(buffer.current_batch_state_size()),
+                                   "history", human_size(buffer.current_batch_history_size()),
+                                   "total", human_size(buffer.current_batch_size())});
         buffer.write_to_db();
 
     } catch (const StageError& ex) {

@@ -157,10 +157,18 @@ TEST_CASE("Cursor") {
     // Cursors cache may get polluted by previous tests or is empty
     // in case this is the only test being executed. So we can't rely
     // on empty() property rather we must evaluate deltas.
+#ifdef USE_PSITRI
+    const size_t original_cache_size{0};
+    REQUIRE(PooledCursor::handles_cache().empty());
+#else
     size_t original_cache_size{PooledCursor::handles_cache().size()};
+#endif
 
     {
         PooledCursor cursor1(txn, map_config);
+#ifdef USE_PSITRI
+        REQUIRE(PooledCursor::handles_cache().empty());
+#else
         if (original_cache_size) {
             // One handle pulled from cache
             REQUIRE(PooledCursor::handles_cache().size() == original_cache_size - 1);
@@ -168,9 +176,13 @@ TEST_CASE("Cursor") {
             // A new handle has been created
             REQUIRE(PooledCursor::handles_cache().size() == original_cache_size);
         }
+#endif
         REQUIRE(cursor1.get_map_stat().ms_entries == 0);
     }
 
+#ifdef USE_PSITRI
+    REQUIRE(PooledCursor::handles_cache().empty());
+#else
     // After destruction of previous cursor cache has increased by one if it was originally empty, otherwise it is
     // restored to its original size
     if (!original_cache_size) {
@@ -178,6 +190,7 @@ TEST_CASE("Cursor") {
     } else {
         REQUIRE(PooledCursor::handles_cache().size() == original_cache_size);
     }
+#endif
 
     txn.abort();
     txn = env.start_write();
@@ -190,10 +203,16 @@ TEST_CASE("Cursor") {
     for (size_t i = 0; i < new_cache_size; ++i) {
         cursors.emplace_back(txn, map_config);
     }
+#ifdef USE_PSITRI
+    REQUIRE(PooledCursor::handles_cache().empty());
+    cursors.clear();
+    REQUIRE(PooledCursor::handles_cache().empty());
+#else
     REQUIRE(PooledCursor::handles_cache().empty() == true);
     cursors.clear();
     REQUIRE(PooledCursor::handles_cache().empty() == false);
     REQUIRE(PooledCursor::handles_cache().size() == new_cache_size);
+#endif
 
     PooledCursor cursor2(PooledCursor(txn, {"test"}));
     REQUIRE(cursor2.operator bool() == true);
@@ -218,8 +237,13 @@ TEST_CASE("Cursor") {
         other_thread_size2 = PooledCursor::handles_cache().size();
     });
     t.join();
+#ifdef USE_PSITRI
+    REQUIRE(other_thread_size1 == 0);
+    REQUIRE(other_thread_size2 == 0);
+#else
     REQUIRE(other_thread_size1 == 1);
     REQUIRE(other_thread_size2 == 0);
+#endif
 }
 
 TEST_CASE("ROAccess/RWAccess ::mdbx::env lifecycle") {

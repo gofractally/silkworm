@@ -47,6 +47,26 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
         CHECK(buffer.read_storage(address, kDefaultIncarnation, location_b) == value_b);
     }
 
+    SECTION("Reuses cached read cursors across reads and transaction renew") {
+        state.reset();
+
+        CHECK(buffer.read_storage(address, kDefaultIncarnation, location_a) == value_a1);
+        CHECK(buffer.read_storage(address, kDefaultIncarnation, location_b) == value_b);
+
+        txn.commit_and_renew();
+
+        CHECK(buffer.read_storage(address, kDefaultIncarnation, location_a) == value_a1);
+
+        buffer.update_storage(address, kDefaultIncarnation, location_a,
+                              /*initial=*/value_a1, /*current=*/value_a2);
+        buffer.write_to_db();
+        CHECK(buffer.read_storage(address, kDefaultIncarnation, location_a) == value_a2);
+
+        txn.commit_and_renew();
+
+        CHECK(buffer.read_storage(address, kDefaultIncarnation, location_a) == value_a2);
+    }
+
     SECTION("Updates storage by address and location") {
         // Update only location A
         buffer.update_storage(address, kDefaultIncarnation, location_a,
@@ -366,6 +386,42 @@ TEST_CASE("Buffer account", "[silkworm][db][buffer]") {
         auto account_changeset{open_cursor(txn, table::kAccountChangeSet)};
         REQUIRE(txn->get_map_stat(account_changeset.map()).ms_entries == 0);
     }
+}
+
+TEST_CASE("Buffer batch limit includes history payload", "[silkworm][db][buffer]") {
+    db::test_util::TempChainData context;
+    auto& txn{context.rw_txn()};
+
+    const evmc::address address{0xbe00000000000000000000000000000000000000_address};
+
+    Account initial_account;
+    initial_account.nonce = 1;
+    initial_account.balance = 0;
+
+    state::AccountEncodable current_account;
+    current_account.nonce = 2;
+    current_account.balance = kEther;
+
+    Buffer buffer{txn, std::make_unique<BufferROTxDataModel>(txn)};
+    buffer.begin_block(1, 1);
+    buffer.update_account(address, /*initial=*/initial_account, current_account);
+
+    const Bytes encoded_initial{state::AccountCodec::encode_for_storage(initial_account, /*omit_code_hash=*/true)};
+    const size_t expected_state_size{kAddressLength + current_account.encoding_length_for_storage()};
+    const size_t expected_history_size{sizeof(BlockNum) + kAddressLength + encoded_initial.size()};
+    const size_t expected_total_size{expected_state_size + expected_history_size};
+
+    CHECK(buffer.current_batch_state_size() == expected_state_size);
+    CHECK(buffer.current_batch_history_size() == expected_history_size);
+    CHECK(buffer.current_batch_size() == expected_total_size);
+
+    buffer.set_memory_limit(expected_total_size - 1);
+    CHECK_THROWS_AS(buffer.begin_block(2, 1), Buffer::MemoryLimitError);
+
+    REQUIRE_NOTHROW(buffer.write_to_db());
+    CHECK(buffer.current_batch_state_size() == 0);
+    CHECK(buffer.current_batch_history_size() == 0);
+    CHECK(buffer.current_batch_size() == 0);
 }
 
 }  // namespace silkworm::db

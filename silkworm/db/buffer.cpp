@@ -14,12 +14,46 @@
 #include <silkworm/db/receipt_cbor.hpp>
 #include <silkworm/db/state/account_codec.hpp>
 #include <silkworm/db/tables.hpp>
+#include <silkworm/infra/common/decoding_exception.hpp>
 #include <silkworm/infra/common/log.hpp>
 #include <silkworm/infra/common/stopwatch.hpp>
 
 namespace silkworm::db {
 
 using datastore::kvdb::to_slice;
+
+void Buffer::reset_cached_cursors() const noexcept {
+    plain_state_cursor_.reset();
+    plain_code_hash_cursor_.reset();
+    cached_cursor_txn_id_.reset();
+}
+
+void Buffer::ensure_cached_cursors_current() const {
+    const uint64_t txn_id{txn_.id()};
+    if (cached_cursor_txn_id_ == txn_id) {
+        return;
+    }
+
+    plain_state_cursor_.reset();
+    plain_code_hash_cursor_.reset();
+    cached_cursor_txn_id_ = txn_id;
+}
+
+datastore::kvdb::ROCursorDupSort& Buffer::plain_state_cursor() const {
+    ensure_cached_cursors_current();
+    if (!plain_state_cursor_) {
+        plain_state_cursor_ = txn_.ro_cursor_dup_sort(table::kPlainState);
+    }
+    return *plain_state_cursor_;
+}
+
+datastore::kvdb::ROCursor& Buffer::plain_code_hash_cursor() const {
+    ensure_cached_cursors_current();
+    if (!plain_code_hash_cursor_) {
+        plain_code_hash_cursor_ = txn_.ro_cursor(table::kPlainCodeHash);
+    }
+    return *plain_code_hash_cursor_;
+}
 
 template <class TFlatHashMap>
 size_t flat_hash_map_memory_size(size_t capacity) {
@@ -41,8 +75,16 @@ size_t flat_hash_map_memory_size_after_inserts(const TFlatHashMap& map, size_t i
     return flat_hash_map_memory_size<TFlatHashMap>(capacity_after_inserts);
 }
 
+static void replace_estimated_size(size_t& total, size_t old_size, size_t new_size) noexcept {
+    if (new_size >= old_size) {
+        total += new_size - old_size;
+    } else {
+        total -= old_size - new_size;
+    }
+}
+
 void Buffer::begin_block(uint64_t block_num, size_t updated_accounts_count) {
-    if (current_batch_state_size() > memory_limit_) {
+    if (current_batch_size() > memory_limit_) {
         throw MemoryLimitError();
     }
     if (flat_hash_map_memory_size_after_inserts(accounts_, updated_accounts_count) > memory_limit_) {
@@ -78,7 +120,15 @@ void Buffer::update_account(const evmc::address& address, std::optional<Account>
             encoded_initial = state::AccountCodec::encode_for_storage(*initial, omit_code_hash);
         }
 
-        block_account_changes_[block_num_].insert_or_assign(address, encoded_initial);
+        auto& account_changes{block_account_changes_[block_num_]};
+        const size_t estimated_size{sizeof(BlockNum) + kAddressLength + encoded_initial.size()};
+        if (auto it{account_changes.find(address)}; it != account_changes.end()) {
+            replace_estimated_size(batch_history_size_, sizeof(BlockNum) + kAddressLength + it->second.size(), estimated_size);
+            it->second = std::move(encoded_initial);
+        } else {
+            batch_history_size_ += estimated_size;
+            account_changes.emplace(address, std::move(encoded_initial));
+        }
     }
 
     size_t encoding_length_for_storage = current ? state::AccountCodec::encoding_length_for_storage(*current) : 0;
@@ -129,8 +179,18 @@ void Buffer::update_storage(const evmc::address& address, uint64_t incarnation, 
     }
     if (block_num_ >= prune_history_threshold_) {
         changed_storage_.insert(address);
-        ByteView initial_val{zeroless_view(initial.bytes)};
-        block_storage_changes_[block_num_][address][incarnation].insert_or_assign(location, initial_val);
+        Bytes initial_val{zeroless_view(initial.bytes)};
+        auto& changed_locations{block_storage_changes_[block_num_][address][incarnation]};
+        const size_t estimated_size{sizeof(BlockNum) + kAddressLength + kIncarnationLength + kLocationLength + initial_val.size()};
+        if (auto it{changed_locations.find(location)}; it != changed_locations.end()) {
+            replace_estimated_size(batch_history_size_,
+                                   sizeof(BlockNum) + kAddressLength + kIncarnationLength + kLocationLength + it->second.size(),
+                                   estimated_size);
+            it->second = std::move(initial_val);
+        } else {
+            batch_history_size_ += estimated_size;
+            changed_locations.emplace(location, std::move(initial_val));
+        }
     }
 
     // Iterator in insert_or_assign return value "is pointing at the element that was inserted or updated"
@@ -273,6 +333,7 @@ void Buffer::write_history_to_db(bool write_change_sets) {
         log::Trace("Flushed history",
                    {"size", human_size(total_written_size), "in", StopWatch::format(sw.since_start(finish_time))});
     }
+    batch_history_size_ = 0;
 }
 
 void Buffer::write_state_to_db() {
@@ -281,6 +342,7 @@ void Buffer::write_state_to_db() {
      * Also ensure to clear unneeded memory data ASAP to let the OS cache
      * to store more database pages for longer
      */
+    reset_cached_cursors();
 
     size_t written_size{0};
     size_t total_written_size{0};
@@ -413,12 +475,26 @@ void Buffer::insert_receipts(uint64_t block_num, const std::vector<Receipt>& rec
         Bytes key{log_key(block_num, i)};
         Bytes value{cbor_encode(receipts[i].logs)};
 
-        logs_.insert_or_assign(key, value);
+        const size_t estimated_size{key.size() + value.size()};
+        if (auto it{logs_.find(key)}; it != logs_.end()) {
+            replace_estimated_size(batch_history_size_, it->first.size() + it->second.size(), estimated_size);
+            it->second = std::move(value);
+        } else {
+            batch_history_size_ += estimated_size;
+            logs_.emplace(std::move(key), std::move(value));
+        }
     }
 
     Bytes key{block_key(block_num)};
     Bytes value{cbor_encode(receipts)};
-    receipts_[key] = value;
+    const size_t estimated_size{key.size() + value.size()};
+    if (auto it{receipts_.find(key)}; it != receipts_.end()) {
+        replace_estimated_size(batch_history_size_, it->first.size() + it->second.size(), estimated_size);
+        it->second = std::move(value);
+    } else {
+        batch_history_size_ += estimated_size;
+        receipts_.emplace(std::move(key), std::move(value));
+    }
 }
 
 void Buffer::insert_call_traces(BlockNum block_num, const CallTraces& traces) {
@@ -444,7 +520,13 @@ void Buffer::insert_call_traces(BlockNum block_num, const CallTraces& traces) {
             }
             values.insert(std::move(value));
         }
-        call_traces_.emplace(block_num, values);
+        size_t estimated_size{0};
+        for (const auto& value : values) {
+            estimated_size += sizeof(BlockNum) + value.size();
+        }
+        if (auto [_, inserted]{call_traces_.emplace(block_num, std::move(values))}; inserted) {
+            batch_history_size_ += estimated_size;
+        }
     }
 }
 
@@ -513,6 +595,29 @@ std::optional<Account> Buffer::read_account(const evmc::address& address) const 
     if (auto it{accounts_.find(address)}; it != accounts_.end()) {
         return it->second;
     }
+    if (!historical_block_.has_value()) {
+        auto& state_cursor{plain_state_cursor()};
+        auto data{state_cursor.find(to_slice(address), /*throw_notfound=*/false)};
+        if (!data.done || data.value.empty()) {
+            return std::nullopt;
+        }
+
+        auto acc_res{state::AccountCodec::from_encoded_storage(datastore::kvdb::from_slice(data.value))};
+        silkworm::success_or_throw(acc_res);
+        Account acc{*acc_res};
+
+        if (acc.incarnation > 0 && acc.code_hash == kEmptyHash) {
+            auto& code_cursor{plain_code_hash_cursor()};
+            auto key{storage_prefix(address, acc.incarnation)};
+            if (auto code_data = code_cursor.find(to_slice(key), /*throw_notfound=*/false);
+                code_data.done && code_data.value.length() == kHashLength) {
+                std::memcpy(acc.code_hash.bytes, code_data.value.data(), kHashLength);
+            }
+        }
+
+        return acc;
+    }
+
     auto db_account{db::read_account(txn_, address, historical_block_)};
     return db_account;
 }
@@ -521,9 +626,15 @@ ByteView Buffer::read_code(const evmc::address& /*address*/, const evmc::bytes32
     if (auto it{hash_to_code_.find(code_hash)}; it != hash_to_code_.end()) {
         return it->second;
     }
-    std::optional<ByteView> code{db::read_code(txn_, code_hash)};
-    ByteView empty;
-    return code.value_or(empty);
+    if (auto it{existing_code_.find(code_hash)}; it != existing_code_.end()) {
+        return it->second;
+    }
+    std::optional<Bytes> code{db::read_code(txn_, code_hash)};
+    if (!code) {
+        return {};
+    }
+    auto [it, _]{existing_code_.emplace(code_hash, std::move(*code))};
+    return it->second;
 }
 
 evmc::bytes32 Buffer::read_storage(const evmc::address& address, uint64_t incarnation,
@@ -535,6 +646,19 @@ evmc::bytes32 Buffer::read_storage(const evmc::address& address, uint64_t incarn
             }
         }
     }
+    if (!historical_block_.has_value()) {
+        auto key{storage_prefix(address, incarnation)};
+        auto value{find_value_suffix(plain_state_cursor(), key, location.bytes)};
+        if (!value) {
+            return {};
+        }
+
+        evmc::bytes32 res{};
+        SILKWORM_ASSERT(value->size() <= kHashLength);
+        std::memcpy(res.bytes + kHashLength - value->size(), value->data(), value->size());
+        return res;
+    }
+
     auto db_storage{db::read_storage(txn_, address, incarnation, location, historical_block_)};
     return db_storage;
 }

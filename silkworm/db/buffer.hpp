@@ -165,8 +165,14 @@ class Buffer : public State {
         return block_storage_changes_;
     }
 
-    //! \brief Approximate size of accrued state in bytes.
+    //! \brief Approximate size of accrued current-state payload in bytes.
     size_t current_batch_state_size() const noexcept { return batch_state_size_; }
+
+    //! \brief Approximate size of accrued history/change-set payload in bytes.
+    size_t current_batch_history_size() const noexcept { return batch_history_size_; }
+
+    //! \brief Approximate size of all accrued database payload in bytes.
+    size_t current_batch_size() const noexcept { return batch_state_size_ + batch_history_size_; }
 
     //! \brief Persists *all* accrued contents into db
     //! \remarks write_history_to_db is implicitly called
@@ -186,8 +192,16 @@ class Buffer : public State {
     };
 
   private:
+    void reset_cached_cursors() const noexcept;
+    void ensure_cached_cursors_current() const;
+    datastore::kvdb::ROCursorDupSort& plain_state_cursor() const;
+    datastore::kvdb::ROCursor& plain_code_hash_cursor() const;
+
     RWTxn& txn_;
     std::unique_ptr<BufferDataModel> data_model_;
+    mutable std::unique_ptr<datastore::kvdb::ROCursorDupSort> plain_state_cursor_;
+    mutable std::unique_ptr<datastore::kvdb::ROCursor> plain_code_hash_cursor_;
+    mutable std::optional<uint64_t> cached_cursor_txn_id_;
 
     // Settings
 
@@ -211,6 +225,7 @@ class Buffer : public State {
 
     absl::btree_map<evmc::address, uint64_t> incarnations_;
     absl::btree_map<evmc::bytes32, Bytes> hash_to_code_;
+    mutable absl::btree_map<evmc::bytes32, Bytes> existing_code_;
     absl::btree_map<Bytes, evmc::bytes32> storage_prefix_to_code_hash_;
 
     // History and changesets
@@ -223,6 +238,7 @@ class Buffer : public State {
 
     // Accounts in memory data for state
     mutable size_t batch_state_size_{0};
+    size_t batch_history_size_{0};
 
     // Current block stuff
     uint64_t block_num_{0};

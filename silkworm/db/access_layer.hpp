@@ -186,7 +186,7 @@ void write_transactions(RWTxn& txn, const std::vector<Transaction>& transactions
 //! \brief Delete transactions from table::kBlockTransactions.
 void delete_transactions(RWTxn& txn, uint64_t base_id, uint64_t count);
 
-std::optional<ByteView> read_code(ROTxn& txn, const evmc::bytes32& code_hash);
+std::optional<Bytes> read_code(ROTxn& txn, const evmc::bytes32& code_hash);
 
 // Reads current or historical (if block_num is specified) account.
 std::optional<Account> read_account(

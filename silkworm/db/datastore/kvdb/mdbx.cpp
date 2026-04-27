@@ -198,6 +198,10 @@ static mdbx::cursor::move_operation move_operation(CursorMoveDirection direction
     return tx.open_cursor(open_map(tx, config));
 }
 
+::mdbx::cursor_managed open_cursor(ROTxn& tx, const MapConfig& config) {
+    return (*tx).open_cursor(tx.cached_map(config));
+}
+
 size_t max_value_size_for_leaf_page(const size_t page_size, const size_t key_size) {
     /*
      * On behalf of configured MDBX page size we need to find
@@ -230,6 +234,18 @@ size_t max_value_size_for_leaf_page(const size_t page_size, const size_t key_siz
 size_t max_value_size_for_leaf_page(const mdbx::txn& txn, const size_t key_size) {
     const size_t page_size{txn.env().get_pagesize()};
     return max_value_size_for_leaf_page(page_size, key_size);
+}
+
+::mdbx::map_handle ROTxn::cached_map(const MapConfig& config) {
+    for (const auto& cached : map_cache_) {
+        if (cached.name == config.name) {
+            return cached.handle;
+        }
+    }
+
+    auto handle{open_map(txn_ref_, config)};
+    map_cache_.push_back({config.name_str(), handle});
+    return handle;
 }
 
 std::unique_ptr<ROCursor> ROTxn::ro_cursor(const MapConfig& config) {
@@ -265,25 +281,41 @@ void RWTxnManaged::commit_and_stop() {
 thread_local ObjectPool<MDBX_cursor, detail::CursorHandleDeleter> PooledCursor::handles_pool_{};
 
 PooledCursor::PooledCursor() {
+#ifndef USE_PSITRI
     handle_ = handles_pool_.acquire();
     if (!handle_) {
         handle_ = ::mdbx_cursor_create(nullptr);
     }
+#endif
 }
 
 PooledCursor::PooledCursor(ROTxn& txn, ::mdbx::map_handle map) {
+#ifndef USE_PSITRI
     handle_ = handles_pool_.acquire();
     if (!handle_) {
         handle_ = ::mdbx_cursor_create(nullptr);
     }
+#endif
     bind(txn, map);
 }
 
 PooledCursor::PooledCursor(::mdbx::txn& txn, const MapConfig& config) {
+#ifndef USE_PSITRI
     handle_ = handles_pool_.acquire();
     if (!handle_) {
         handle_ = ::mdbx_cursor_create(nullptr);
     }
+#endif
+    bind(txn, config);
+}
+
+PooledCursor::PooledCursor(ROTxn& txn, const MapConfig& config) {
+#ifndef USE_PSITRI
+    handle_ = handles_pool_.acquire();
+    if (!handle_) {
+        handle_ = ::mdbx_cursor_create(nullptr);
+    }
+#endif
     bind(txn, config);
 }
 
@@ -311,30 +343,58 @@ PooledCursor::~PooledCursor() {
 }
 
 void PooledCursor::bind(ROTxn& txn, ::mdbx::map_handle map) {
+#ifndef USE_PSITRI
     if (!handle_) throw std::runtime_error("cannot bind a closed cursor");
+#endif
     // Check cursor is bound to a live transaction
     if (auto cm_tx{mdbx_cursor_txn(handle_)}; cm_tx) {
         // If current transaction id does not match cursor's transaction close it and recreate a new one
         if (txn->id() != mdbx_txn_id(cm_tx)) {
             close();
+#ifndef USE_PSITRI
             handle_ = ::mdbx_cursor_create(nullptr);
+#endif
         }
     }
+#ifdef USE_PSITRI
+    if (!handle_) {
+        MDBX_cursor* c{nullptr};
+        mdbx::error::success_or_throw(::mdbx_cursor_open(*txn, map.dbi, &c));
+        handle_ = c;
+        return;
+    }
+#endif
     ::mdbx::cursor::bind(*txn, map);
 }
 
 void PooledCursor::bind(::mdbx::txn& txn, const MapConfig& config) {
+#ifndef USE_PSITRI
     if (!handle_) throw std::runtime_error("cannot bind a closed cursor");
+#endif
     // Check cursor is bound to a live transaction
     if (auto cm_tx{mdbx_cursor_txn(handle_)}; cm_tx) {
         // If current transaction id does not match cursor's transaction close it and recreate a new one
         if (txn.id() != mdbx_txn_id(cm_tx)) {
             close();
+#ifndef USE_PSITRI
             handle_ = ::mdbx_cursor_create(nullptr);
+#endif
         }
     }
     const auto map{open_map(txn, config)};
+#ifdef USE_PSITRI
+    if (!handle_) {
+        MDBX_cursor* c{nullptr};
+        mdbx::error::success_or_throw(::mdbx_cursor_open(txn, map.dbi, &c));
+        handle_ = c;
+        return;
+    }
+#endif
     ::mdbx::cursor::bind(txn, map);
+}
+
+void PooledCursor::bind(ROTxn& txn, const MapConfig& config) {
+    bind(txn, txn.cached_map(config));
 }
 
 std::unique_ptr<ROCursor> PooledCursor::clone() {

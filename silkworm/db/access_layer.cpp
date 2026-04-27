@@ -596,10 +596,10 @@ void delete_body(RWTxn& txn, const evmc::bytes32& hash, BlockNum block_num) {
     cursor->erase(to_slice(key));
 }
 
-static ByteView read_senders_raw(ROTxn& txn, const Bytes& key) {
+static Bytes read_senders_raw(ROTxn& txn, const Bytes& key) {
     auto cursor = txn.ro_cursor(table::kSenders);
     auto data{cursor->find(to_slice(key), /*throw_notfound = */ false)};
-    return data ? from_slice(data.value) : ByteView();
+    return data ? Bytes{from_slice(data.value)} : Bytes{};
 }
 
 std::vector<evmc::address> read_senders(ROTxn& txn, BlockNum block_num, const uint8_t (&hash)[kHashLength]) {
@@ -673,18 +673,18 @@ void write_receipts(RWTxn& txn, const std::vector<silkworm::Receipt>& receipts, 
     target->upsert(to_slice(key), to_slice(value));
 }
 
-std::optional<ByteView> read_code(ROTxn& txn, const evmc::bytes32& code_hash) {
+std::optional<Bytes> read_code(ROTxn& txn, const evmc::bytes32& code_hash) {
     auto cursor = txn.ro_cursor(table::kCode);
     auto key{to_slice(code_hash)};
     auto data{cursor->find(key, /*throw_notfound=*/false)};
     if (!data) {
         return std::nullopt;
     }
-    return from_slice(data.value);
+    return Bytes{from_slice(data.value)};
 }
 
 // Erigon FindByHistory for account
-static std::optional<ByteView> historical_account(ROTxn& txn, const evmc::address& address, BlockNum block_num) {
+static std::optional<Bytes> historical_account(ROTxn& txn, const evmc::address& address, BlockNum block_num) {
     auto cursor = txn.ro_cursor_dup_sort(table::kAccountHistory);
     const Bytes history_key{account_history_key(address, block_num)};
     const auto data{cursor->lower_bound(to_slice(history_key), /*throw_notfound=*/false)};
@@ -700,12 +700,16 @@ static std::optional<ByteView> historical_account(ROTxn& txn, const evmc::addres
 
     cursor->bind(txn, table::kAccountChangeSet);
     const Bytes change_set_key{block_key(*change_block)};
-    return find_value_suffix(*cursor, change_set_key, address.bytes);
+    auto value{find_value_suffix(*cursor, change_set_key, address.bytes)};
+    if (!value) {
+        return std::nullopt;
+    }
+    return Bytes{*value};
 }
 
 // Erigon FindByHistory for storage
-static std::optional<ByteView> historical_storage(ROTxn& txn, const evmc::address& address, uint64_t incarnation,
-                                                  const evmc::bytes32& location, BlockNum block_num) {
+static std::optional<Bytes> historical_storage(ROTxn& txn, const evmc::address& address, uint64_t incarnation,
+                                               const evmc::bytes32& location, BlockNum block_num) {
     auto cursor = txn.ro_cursor_dup_sort(table::kStorageHistory);
     const Bytes history_key{storage_history_key(address, location, block_num)};
     const auto data{cursor->lower_bound(to_slice(history_key), /*throw_notfound=*/false)};
@@ -729,12 +733,18 @@ static std::optional<ByteView> historical_storage(ROTxn& txn, const evmc::addres
 
     cursor->bind(txn, table::kStorageChangeSet);
     const Bytes change_set_key{storage_change_key(*change_block, address, incarnation)};
-    return find_value_suffix(*cursor, change_set_key, location.bytes);
+    auto value{find_value_suffix(*cursor, change_set_key, location.bytes)};
+    if (!value) {
+        return std::nullopt;
+    }
+    return Bytes{*value};
 }
 
 std::optional<Account> read_account(ROTxn& txn, const evmc::address& address, std::optional<BlockNum> block_num) {
-    std::optional<ByteView> encoded{block_num.has_value() ? historical_account(txn, address, block_num.value())
-                                                          : std::nullopt};
+    std::optional<Bytes> encoded;
+    if (block_num.has_value()) {
+        encoded = historical_account(txn, address, block_num.value());
+    }
 
     if (!encoded.has_value()) {
         auto state_cursor = txn.ro_cursor_dup_sort(table::kPlainState);
@@ -765,13 +775,17 @@ std::optional<Account> read_account(ROTxn& txn, const evmc::address& address, st
 
 evmc::bytes32 read_storage(ROTxn& txn, const evmc::address& address, uint64_t incarnation,
                            const evmc::bytes32& location, std::optional<BlockNum> block_num) {
-    std::optional<ByteView> val{block_num.has_value()
-                                    ? historical_storage(txn, address, incarnation, location, block_num.value())
-                                    : std::nullopt};
+    std::optional<Bytes> val;
+    if (block_num.has_value()) {
+        val = historical_storage(txn, address, incarnation, location, block_num.value());
+    }
     if (!val.has_value()) {
         auto cursor = txn.ro_cursor_dup_sort(table::kPlainState);
         auto key{storage_prefix(address, incarnation)};
-        val = find_value_suffix(*cursor, key, location.bytes);
+        auto value{find_value_suffix(*cursor, key, location.bytes)};
+        if (value) {
+            val.emplace(*value);
+        }
     }
 
     if (!val.has_value()) {
@@ -785,7 +799,7 @@ evmc::bytes32 read_storage(ROTxn& txn, const evmc::address& address, uint64_t in
 }
 
 static std::optional<uint64_t> historical_previous_incarnation(ROTxn& txn, const evmc::address& address, BlockNum block_num) {
-    std::optional<ByteView> encoded_account{historical_account(txn, address, block_num + 1)};
+    std::optional<Bytes> encoded_account{historical_account(txn, address, block_num + 1)};
     if (!encoded_account) {
         return std::nullopt;
     }
@@ -868,10 +882,10 @@ std::optional<ChainConfig> read_chain_config(ROTxn& txn) {
     if (!data) {
         return std::nullopt;
     }
-    const auto key{data.value};
+    const Bytes key{from_slice(data.value)};
 
     canonical_hashes_cursor->bind(txn, table::kConfig);
-    data = canonical_hashes_cursor->find(key, /*throw_notfound=*/false);
+    data = canonical_hashes_cursor->find(to_slice(key), /*throw_notfound=*/false);
     if (!data) {
         return std::nullopt;
     }
