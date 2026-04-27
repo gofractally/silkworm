@@ -3,8 +3,8 @@
 	url = https://github.com/Tradias/asio-grpc.git
 [submodule "evmone"]
 	path = third_party/evmone/evmone
-	url = https://github.com/erigontech/evmone.git
-	branch = remove_tracers
+	url = git@github.com:gofractally/evmone.git
+	branch = psitri-silkworm-backend
 [submodule "ethereum-tests"]
 	path = third_party/ethereum-tests
 	url = https://github.com/ethereum/tests.git
