@@ -66,6 +66,8 @@ Bytes storage_prefix(ByteView address, uint64_t incarnation);
 
 Bytes storage_prefix(const evmc::address& address, uint64_t incarnation);
 
+Bytes storage_key(ByteView storage_prefix, ByteView location);
+
 Bytes composite_storage_key(const evmc::address& address, uint64_t incarnation, HashAsArray hash);
 
 // Erigon EncodeBlockNumber
@@ -128,6 +130,22 @@ std::optional<ByteView> find_value_suffix(datastore::kvdb::ROCursorDupSort& tabl
 
 // We can't simply call upsert for storage values because they live in mdbx::value_mode::multi tables
 void upsert_storage_value(datastore::kvdb::RWCursorDupSort& state_cursor, ByteView storage_prefix, ByteView location, ByteView new_value);
+
+std::optional<ByteView> find_flat_storage_value(datastore::kvdb::ROCursor& table, ByteView storage_prefix, ByteView location);
+
+std::optional<ByteView> find_flat_storage_value(datastore::kvdb::ROCursor& table, const evmc::address& address,
+                                                uint64_t incarnation, ByteView location);
+
+datastore::kvdb::CursorResult lower_bound_flat_storage(
+    datastore::kvdb::ROCursor& table,
+    ByteView storage_prefix,
+    ByteView location_prefix,
+    bool throw_notfound = false);
+
+void upsert_flat_storage_value(datastore::kvdb::RWCursor& state_cursor, ByteView storage_prefix, ByteView location, ByteView new_value);
+
+void upsert_flat_storage_value(datastore::kvdb::RWCursor& state_cursor, const evmc::address& address,
+                               uint64_t incarnation, ByteView location, ByteView new_value);
 
 //! Build key for account domain given the target address and location
 Bytes account_domain_key(const evmc::address& address);

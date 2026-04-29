@@ -3,14 +3,58 @@
 
 #include "tables.hpp"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 #include <silkworm/db/access_layer.hpp>
 
 namespace silkworm::db::table {
 
+namespace {
+
+bool env_enabled(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string_view flag{value};
+    return !flag.empty() && flag != "0" && flag != "false" && flag != "FALSE" && flag != "off" && flag != "OFF";
+}
+
+}  // namespace
+
+bool use_psitri_optimized_hashed_storage() {
+#ifdef USE_PSITRI
+    static const bool enabled = [] {
+        if (const char* layout = std::getenv("SILKWORM_DB_LAYOUT")) {
+            return std::string_view{layout} == "psitri-optimized";
+        }
+        return env_enabled(std::getenv("SILKWORM_PSITRI_OPTIMIZED_LAYOUT"));
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool use_psitri_optimized_plain_state() {
+    return use_psitri_optimized_hashed_storage();
+}
+
+MapConfig plain_state_config() {
+    return use_psitri_optimized_plain_state() ? kPlainStatePsitriOptimized : kPlainState;
+}
+
+MapConfig hashed_storage_config() {
+    return use_psitri_optimized_hashed_storage() ? kHashedStoragePsitriOptimized : kHashedStorage;
+}
+
 void check_or_create_chaindata_tables(RWTxn& txn) {
-    for (const auto& config : kChainDataTables) {
+    for (const auto& table_config : kChainDataTables) {
+        const auto config = table_config.name == kHashedStorageName
+                                ? hashed_storage_config()
+                                : table_config.name == kPlainStateName ? plain_state_config() : table_config;
+
         if (has_map(txn, config.name)) {
             ::mdbx::map_handle table_map = txn->open_map(config.name_str());
             auto table_info{txn->get_handle_info(table_map)};
@@ -38,6 +82,12 @@ void check_or_create_chaindata_tables(RWTxn& txn) {
 std::optional<MapConfig> get_map_config(std::string_view map_name) {
     for (const auto& table_config : kChainDataTables) {
         if (table_config.name == map_name) {
+            if (table_config.name == kHashedStorageName) {
+                return hashed_storage_config();
+            }
+            if (table_config.name == kPlainStateName) {
+                return plain_state_config();
+            }
             return table_config;
         }
     }

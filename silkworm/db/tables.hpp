@@ -179,6 +179,13 @@ inline constexpr MapConfig kHashedCodeHash{"HashedCodeHash"};
 //! \endverbatim
 inline constexpr std::string_view kHashedStorageName{"HashedStorage"};
 inline constexpr MapConfig kHashedStorage{kHashedStorageName, mdbx::key_mode::usual, mdbx::value_mode::multi};
+inline constexpr MapConfig kHashedStoragePsitriOptimized{kHashedStorageName, mdbx::key_mode::usual, mdbx::value_mode::single};
+
+//! \brief True when HashedStorage uses key = address_hash + incarnation + storage_hash and value = storage_value.
+bool use_psitri_optimized_hashed_storage();
+
+//! \brief Active HashedStorage table layout for this process.
+MapConfig hashed_storage_config();
 
 inline constexpr std::string_view kHeadBlockName{"LastBlock"};
 inline constexpr MapConfig kHeadBlock{kHeadBlockName};
@@ -264,9 +271,19 @@ inline constexpr MapConfig kPlainCodeHash{kPlainCodeHashName};
 //! Storage :
 //!   key   : address (20 bytes) + incarnation (u64 BE)
 //!   value : storage key (32 bytes) + storage value (hash 32 bytes)
+//! PsiTri optimized storage :
+//!   key   : address (20 bytes) + incarnation (u64 BE) + storage key (32 bytes)
+//!   value : storage value
 //! \endverbatim
 inline constexpr std::string_view kPlainStateName{"PlainState"};
 inline constexpr MapConfig kPlainState{kPlainStateName, mdbx::key_mode::usual, mdbx::value_mode::multi};
+inline constexpr MapConfig kPlainStatePsitriOptimized{kPlainStateName, mdbx::key_mode::usual, mdbx::value_mode::single};
+
+//! \brief True when PlainState storage uses key = address + incarnation + location and value = storage_value.
+bool use_psitri_optimized_plain_state();
+
+//! \brief Active PlainState table layout for this process.
+MapConfig plain_state_config();
 
 //! \details Store recovered senders' addresses for each transaction in a block
 //! \remarks Senders' addresses are not stored in transactions so they must be recovered from the signature

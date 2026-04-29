@@ -3,14 +3,54 @@
 
 #include "processor.hpp"
 
+#include <cstdlib>
+#include <string>
+
 #include <evmone/test/state/state.hpp>
 
 #include <silkworm/core/common/assert.hpp>
 #include <silkworm/core/protocol/intrinsic_gas.hpp>
 #include <silkworm/core/protocol/param.hpp>
 #include <silkworm/core/trie/vector_root.hpp>
+#include <silkworm/infra/common/log.hpp>
 
 namespace silkworm {
+namespace {
+
+struct TxTraceSelection {
+    bool enabled{false};
+    uint64_t block_num{0};
+    uint64_t tx_index{0};
+};
+
+TxTraceSelection tx_trace_selection() {
+    static const TxTraceSelection selection = [] {
+        TxTraceSelection result;
+        const char* block_num = std::getenv("SILKWORM_TRACE_BLOCK");
+        const char* tx_index = std::getenv("SILKWORM_TRACE_TX_INDEX");
+        if (block_num == nullptr || tx_index == nullptr) {
+            return result;
+        }
+        result.enabled = true;
+        result.block_num = std::strtoull(block_num, nullptr, 10);
+        result.tx_index = std::strtoull(tx_index, nullptr, 10);
+        return result;
+    }();
+    return selection;
+}
+
+thread_local bool g_trace_state_view{false};
+thread_local uint64_t g_trace_block_num{0};
+thread_local uint64_t g_trace_tx_index{0};
+thread_local std::string g_trace_tx_hash;
+
+bool should_trace_tx(uint64_t block_num, uint64_t tx_index) {
+    const TxTraceSelection selection = tx_trace_selection();
+    return selection.enabled && selection.block_num == block_num && selection.tx_index == tx_index;
+}
+
+}  // namespace
+
 class StateView final : public evmone::state::StateView {
     IntraBlockState& state_;
 
@@ -19,10 +59,31 @@ class StateView final : public evmone::state::StateView {
 
     std::optional<Account> get_account(const evmc::address& addr) const noexcept override {
         const auto* obj = state_.get_object(addr);
-        if (obj == nullptr || !obj->current.has_value())
+        if (obj == nullptr || !obj->current.has_value()) {
+            if (g_trace_state_view) {
+                SILK_ERROR_M("PsiTriTxTrace",
+                             {"event", "get_account",
+                              "block", std::to_string(g_trace_block_num),
+                              "tx_index", std::to_string(g_trace_tx_index),
+                              "tx_hash", g_trace_tx_hash,
+                              "address", to_hex(addr.bytes, true),
+                              "present", "0"});
+            }
             return std::nullopt;
+        }
 
         const auto& cur = *obj->current;
+        if (g_trace_state_view) {
+            SILK_ERROR_M("PsiTriTxTrace",
+                         {"event", "get_account",
+                          "block", std::to_string(g_trace_block_num),
+                          "tx_index", std::to_string(g_trace_tx_index),
+                          "tx_hash", g_trace_tx_hash,
+                          "address", to_hex(addr.bytes, true),
+                          "present", "1",
+                          "nonce", std::to_string(cur.nonce),
+                          "code_hash", to_hex(cur.code_hash.bytes, true)});
+        }
         return Account{
             .nonce = cur.nonce,
             .balance = cur.balance,
@@ -37,11 +98,32 @@ class StateView final : public evmone::state::StateView {
     }
 
     evmone::bytes get_account_code(const evmc::address& addr) const noexcept override {
-        return evmone::bytes{state_.get_code(addr)};
+        auto code = state_.get_code(addr);
+        if (g_trace_state_view) {
+            SILK_ERROR_M("PsiTriTxTrace",
+                         {"event", "get_account_code",
+                          "block", std::to_string(g_trace_block_num),
+                          "tx_index", std::to_string(g_trace_tx_index),
+                          "tx_hash", g_trace_tx_hash,
+                          "address", to_hex(addr.bytes, true),
+                          "size", std::to_string(code.size())});
+        }
+        return evmone::bytes{code};
     }
 
     evmc::bytes32 get_storage(const evmc::address& addr, const evmc::bytes32& key) const noexcept override {
-        return state_.get_original_storage(addr, key);
+        auto value = state_.get_original_storage(addr, key);
+        if (g_trace_state_view) {
+            SILK_ERROR_M("PsiTriTxTrace",
+                         {"event", "get_storage",
+                          "block", std::to_string(g_trace_block_num),
+                          "tx_index", std::to_string(g_trace_tx_index),
+                          "tx_hash", g_trace_tx_hash,
+                          "address", to_hex(addr.bytes, true),
+                          "key", to_hex(key.bytes, true),
+                          "value", to_hex(value.bytes, true)});
+        }
+        return value;
     }
 };
 
@@ -394,14 +476,45 @@ ValidationResult ExecutionProcessor::execute_block_no_post_validation(std::vecto
 
     receipts.resize(block.transactions.size());
     auto receipt_it{receipts.begin()};
+    uint64_t tx_index{0};
 
     for (const auto& txn : block.transactions) {
         const ValidationResult err{protocol::validate_transaction(txn, state_, available_gas())};
         if (err != ValidationResult::kOk) {
             return err;
         }
+        const bool trace_tx = should_trace_tx(block.header.number, tx_index);
+        const auto gas_before = cumulative_gas_used_;
+        if (trace_tx) {
+            g_trace_state_view = true;
+            g_trace_block_num = block.header.number;
+            g_trace_tx_index = tx_index;
+            g_trace_tx_hash = to_hex(txn.hash());
+            SILK_ERROR_M("PsiTriTxTrace",
+                         {"event", "tx_start",
+                          "block", std::to_string(block.header.number),
+                          "tx_index", std::to_string(tx_index),
+                          "tx_hash", g_trace_tx_hash,
+                          "from", txn.sender() ? to_hex(txn.sender()->bytes, true) : "",
+                          "to", txn.to ? to_hex(txn.to->bytes, true) : "",
+                          "gas_limit", std::to_string(txn.gas_limit)});
+        }
         execute_transaction(txn, *receipt_it);
+        if (trace_tx) {
+            SILK_ERROR_M("PsiTriTxTrace",
+                         {"event", "tx_end",
+                          "block", std::to_string(block.header.number),
+                          "tx_index", std::to_string(tx_index),
+                          "tx_hash", g_trace_tx_hash,
+                          "tx_gas", std::to_string(receipt_it->cumulative_gas_used - gas_before),
+                          "cumulative_gas", std::to_string(receipt_it->cumulative_gas_used)});
+            g_trace_state_view = false;
+            g_trace_block_num = 0;
+            g_trace_tx_index = 0;
+            g_trace_tx_hash.clear();
+        }
         ++receipt_it;
+        ++tx_index;
     }
 
     std::vector<Log> logs;
@@ -426,6 +539,32 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
     const auto& header{evm_.block().header};
 
     if (cumulative_gas_used_ != header.gas_used) {
+        const uint64_t last_receipt_gas{receipts.empty() ? 0 : receipts.back().cumulative_gas_used};
+        std::string receipt_cumulative_gas;
+        std::string receipt_tx_gas;
+        receipt_cumulative_gas.reserve(receipts.size() * 10);
+        receipt_tx_gas.reserve(receipts.size() * 10);
+        uint64_t previous_cumulative_gas{0};
+        for (const auto& receipt : receipts) {
+            if (!receipt_cumulative_gas.empty()) {
+                receipt_cumulative_gas.push_back(',');
+                receipt_tx_gas.push_back(',');
+            }
+            receipt_cumulative_gas.append(std::to_string(receipt.cumulative_gas_used));
+            receipt_tx_gas.append(std::to_string(receipt.cumulative_gas_used - previous_cumulative_gas));
+            previous_cumulative_gas = receipt.cumulative_gas_used;
+        }
+        SILK_ERROR_M("ExecutionProcessor",
+                     {"block", std::to_string(header.number),
+                      "hash", to_hex(header.hash().bytes, true),
+                      "txs", std::to_string(evm_.block().transactions.size()),
+                      "header_gas_used", std::to_string(header.gas_used),
+                      "computed_gas_used", std::to_string(cumulative_gas_used_),
+                      "last_receipt_gas", std::to_string(last_receipt_gas),
+                      "delta", std::to_string(static_cast<int64_t>(cumulative_gas_used_) -
+                                              static_cast<int64_t>(header.gas_used)),
+                      "receipt_cumulative_gas", receipt_cumulative_gas,
+                      "receipt_tx_gas", receipt_tx_gas});
         return ValidationResult::kWrongBlockGas;
     }
 

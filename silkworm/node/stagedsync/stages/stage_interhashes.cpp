@@ -219,7 +219,7 @@ trie::PrefixSet InterHashes::collect_account_changes(RWTxn& txn, BlockNum from, 
     trie::PrefixSet ret;
 
     auto account_changeset = txn.ro_cursor_dup_sort(table::kAccountChangeSet);
-    auto plain_state = txn.ro_cursor_dup_sort(table::kPlainState);
+    auto plain_state = txn.ro_cursor(table::plain_state_config());
 
     auto changeset_data{account_changeset->lower_bound(to_slice(starting_key), /*throw_notfound=*/false)};
 

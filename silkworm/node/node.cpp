@@ -46,6 +46,7 @@ class NodeImpl final {
     NodeImpl& operator=(const NodeImpl&) = delete;
 
     Task<void> run();
+    void request_stop();
     Task<void> run_tasks();
     Task<void> wait_for_setup();
 
@@ -241,6 +242,10 @@ Task<void> NodeImpl::run() {
     }
 }
 
+void NodeImpl::request_stop() {
+    snapshot_sync_.request_stop();
+}
+
 Task<void> NodeImpl::run_tasks() {
     using namespace concurrency::awaitable_wait_for_all;
 
@@ -302,6 +307,10 @@ Node::~Node() = default;
 
 Task<void> Node::run() {
     return p_impl_->run();
+}
+
+void Node::request_stop() {
+    p_impl_->request_stop();
 }
 
 Task<void> Node::wait_for_setup() {

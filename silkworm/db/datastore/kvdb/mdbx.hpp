@@ -521,6 +521,7 @@ class PooledCursor : public RWCursorDupSort, protected ::mdbx::cursor {
 
   private:
     static thread_local ObjectPool<MDBX_cursor, detail::CursorHandleDeleter> handles_pool_;
+    std::string map_name_;
 };
 
 //! \brief Checks whether a provided map name exists in database

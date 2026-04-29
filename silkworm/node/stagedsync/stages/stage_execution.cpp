@@ -15,6 +15,7 @@
 #include <silkworm/db/access_layer.hpp>
 #include <silkworm/db/buffer.hpp>
 #include <silkworm/db/state/account_codec.hpp>
+#include <silkworm/db/tables.hpp>
 #include <silkworm/execution/block_executor.hpp>
 #include <silkworm/infra/common/decoding_exception.hpp>
 #include <silkworm/infra/common/environment.hpp>
@@ -201,11 +202,6 @@ Stage::Result Execution::execute_batch(RWTxn& txn, BlockNum max_block_num, Analy
 
         std::vector<Receipt> receipts;
 
-        {
-            std::unique_lock progress_lock(progress_mtx_);
-            lap_time_ = std::chrono::steady_clock::now();
-        }
-
         while (block_num_ <= max_block_num) {
             if (prefetched_blocks_.empty()) {
                 throw_if_stopping();
@@ -323,7 +319,7 @@ Stage::Result Execution::unwind(RWTxn& txn) {
 
         {
             // Revert states
-            auto plain_state_cursor = txn.rw_cursor_dup_sort(table::kPlainState);
+            auto plain_state_cursor = txn.rw_cursor(table::plain_state_config());
             auto plain_code_cursor = txn.rw_cursor(table::kPlainCodeHash);
             auto account_changeset_cursor = txn.ro_cursor_dup_sort(table::kAccountChangeSet);
             auto storage_changeset_cursor = txn.ro_cursor_dup_sort(table::kStorageChangeSet);
@@ -505,14 +501,17 @@ std::vector<std::string> Execution::get_log_progress() {
     std::unique_lock progress_lock(progress_mtx_);
     auto now{std::chrono::steady_clock::now()};
     auto elapsed{now - lap_time_};
-    lap_time_ = now;
     auto elapsed_seconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
-    if (!elapsed_seconds || !processed_blocks_) {
+    if (!processed_blocks_) {
+        return {"block", std::to_string(block_num_), "db", "waiting ..."};
+    }
+    if (!elapsed_seconds) {
         return {"block", std::to_string(block_num_), "db", "waiting ..."};
     }
     auto speed_blocks = processed_blocks_ / elapsed_seconds;
     auto speed_transactions = processed_transactions_ / elapsed_seconds;
     auto speed_mgas = processed_gas_ / elapsed_seconds / 1'000'000;
+    lap_time_ = now;
     processed_blocks_ = 0;
     processed_transactions_ = 0;
     processed_gas_ = 0;
@@ -522,7 +521,7 @@ std::vector<std::string> Execution::get_log_progress() {
             "txns/s", std::to_string(speed_transactions), "Mgas/s", std::to_string(speed_mgas)};
 }
 
-void Execution::revert_state(ByteView key, ByteView value, RWCursorDupSort& plain_state_table,
+void Execution::revert_state(ByteView key, ByteView value, RWCursor& plain_state_table,
                              RWCursor& plain_code_table) {
     if (key.size() == kAddressLength) {
         if (!value.empty()) {
@@ -552,7 +551,13 @@ void Execution::revert_state(ByteView key, ByteView value, RWCursorDupSort& plai
                 }
             }
             Bytes new_encoded_account = db::state::AccountCodec::encode_for_storage(account);
-            plain_state_table.erase(to_slice(key), /*whole_multivalue=*/true);
+            if (table::use_psitri_optimized_plain_state()) {
+                plain_state_table.erase(to_slice(key));
+            } else if (auto* dup_cursor = dynamic_cast<RWCursorDupSort*>(&plain_state_table)) {
+                dup_cursor->erase(to_slice(key), /*whole_multivalue=*/true);
+            } else {
+                throw std::logic_error("PlainState cursor does not support multivalue operations");
+            }
             plain_state_table.upsert(to_slice(key), to_slice(new_encoded_account));
         } else {
             plain_state_table.erase(to_slice(key));
@@ -561,17 +566,27 @@ void Execution::revert_state(ByteView key, ByteView value, RWCursorDupSort& plai
     }
     auto location{key.substr(kAddressLength + kIncarnationLength)};
     auto key1{key.substr(0, kAddressLength + kIncarnationLength)};
-    if (find_value_suffix(plain_state_table, key1, location) != std::nullopt) {
-        plain_state_table.erase();
-    }
-    if (!value.empty()) {
-        Bytes data{location};
-        data.append(value);
-        plain_state_table.upsert(to_slice(key1), to_slice(data));
+    if (table::use_psitri_optimized_plain_state()) {
+        if (value.empty()) {
+            plain_state_table.erase(to_slice(key));
+        } else {
+            plain_state_table.upsert(to_slice(key), to_slice(value));
+        }
+    } else if (auto* dup_cursor = dynamic_cast<RWCursorDupSort*>(&plain_state_table)) {
+        if (find_value_suffix(*dup_cursor, key1, location) != std::nullopt) {
+            dup_cursor->erase();
+        }
+        if (!value.empty()) {
+            Bytes data{location};
+            data.append(value);
+            dup_cursor->upsert(to_slice(key1), to_slice(data));
+        }
+    } else {
+        throw std::logic_error("PlainState cursor does not support multivalue operations");
     }
 }
 
-void Execution::unwind_state_from_changeset(ROCursor& source_changeset, RWCursorDupSort& plain_state_table,
+void Execution::unwind_state_from_changeset(ROCursor& source_changeset, RWCursor& plain_state_table,
                                             RWCursor& plain_code_table, BlockNum unwind_to) {
     auto src_data{source_changeset.to_last(/*throw_notfound*/ false)};
     while (src_data) {

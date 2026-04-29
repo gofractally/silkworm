@@ -49,7 +49,7 @@ class TrieLoader {
     static evmc::bytes32 calculate_storage_root(
         TrieCursor& trie_storage_cursor,
         HashBuilder& storage_hash_builder,
-        datastore::kvdb::ROCursorDupSort& hashed_storage,
+        datastore::kvdb::ROCursor& hashed_storage,
         const Bytes& db_storage_prefix);
 };
 }  // namespace silkworm::trie

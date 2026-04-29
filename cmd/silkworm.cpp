@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <optional>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -44,6 +45,11 @@ const char* current_exception_name() {
 #endif
 }
 
+Task<void> wait_for_shutdown_signal(node::Node& execution_node) {
+    co_await ShutdownSignal::wait();
+    execution_node.request_stop();
+}
+
 struct PruneModeValidator : public CLI::Validator {
     explicit PruneModeValidator() {
         func_ = [](const std::string& value) -> std::string {
@@ -67,6 +73,14 @@ void parse_silkworm_command_line(CLI::App& cli, int argc, char* argv[], node::Se
 
     std::filesystem::path data_dir_path;
     add_option_data_dir(cli, data_dir_path);
+
+    std::string db_layout{"lmdbx-compatible"};
+    auto db_layout_opt = cli.add_option(
+        "--db.layout",
+        db_layout,
+        "Database physical layout: lmdbx-compatible or psitri-optimized")
+                             ->capture_default_str()
+                             ->check(CLI::IsMember({"lmdbx-compatible", "psitri-optimized"}));
 
     // Node settings
     add_node_options(cli, settings.node_settings);
@@ -124,6 +138,14 @@ void parse_silkworm_command_line(CLI::App& cli, int argc, char* argv[], node::Se
     add_rpcdaemon_options(cli, settings.rpcdaemon_settings);
 
     cli.parse(argc, argv);
+
+    if (db_layout_opt->count()) {
+#ifdef WIN32
+        _putenv_s("SILKWORM_DB_LAYOUT", db_layout.c_str());
+#else
+        ::setenv("SILKWORM_DB_LAYOUT", db_layout.c_str(), 1);
+#endif
+    }
 
     // Validate and assign settings
 
@@ -227,7 +249,7 @@ int main(int argc, char* argv[]) {
         // Go!
         auto run_future = boost::asio::co_spawn(
             context_pool.any_executor(),
-            execution_node.run() || ShutdownSignal::wait(),
+            execution_node.run() || wait_for_shutdown_signal(execution_node),
             boost::asio::use_future);
         context_pool.start();
         SILK_INFO << "Silkworm is now running";

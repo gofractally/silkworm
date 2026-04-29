@@ -172,7 +172,7 @@ class Buffer : public State {
     size_t current_batch_history_size() const noexcept { return batch_history_size_; }
 
     //! \brief Approximate size of all accrued database payload in bytes.
-    size_t current_batch_size() const noexcept { return batch_state_size_ + batch_history_size_; }
+    size_t current_batch_size() const noexcept { return batch_state_size_ + batch_history_size_ + batch_txn_write_size_; }
 
     //! \brief Persists *all* accrued contents into db
     //! \remarks write_history_to_db is implicitly called
@@ -194,12 +194,12 @@ class Buffer : public State {
   private:
     void reset_cached_cursors() const noexcept;
     void ensure_cached_cursors_current() const;
-    datastore::kvdb::ROCursorDupSort& plain_state_cursor() const;
+    datastore::kvdb::ROCursor& plain_state_cursor() const;
     datastore::kvdb::ROCursor& plain_code_hash_cursor() const;
 
     RWTxn& txn_;
     std::unique_ptr<BufferDataModel> data_model_;
-    mutable std::unique_ptr<datastore::kvdb::ROCursorDupSort> plain_state_cursor_;
+    mutable std::unique_ptr<datastore::kvdb::ROCursor> plain_state_cursor_;
     mutable std::unique_ptr<datastore::kvdb::ROCursor> plain_code_hash_cursor_;
     mutable std::optional<uint64_t> cached_cursor_txn_id_;
 
@@ -239,6 +239,7 @@ class Buffer : public State {
     // Accounts in memory data for state
     mutable size_t batch_state_size_{0};
     size_t batch_history_size_{0};
+    size_t batch_txn_write_size_{0};
 
     // Current block stuff
     uint64_t block_num_{0};

@@ -512,7 +512,7 @@ TEST_CASE("Storage", "[db][access_layer]") {
     test_util::TempChainData context;
     auto& txn{context.rw_txn()};
 
-    PooledCursor table{txn, table::kPlainState};
+    PooledCursor state_table{txn, table::plain_state_config()};
 
     const evmc::address addr{0xb000000000000000000000000000000000000008_address};
     const Bytes key{storage_prefix(addr, kDefaultIncarnation)};
@@ -526,9 +526,15 @@ TEST_CASE("Storage", "[db][access_layer]") {
     const evmc::bytes32 val2{0x000000000000000000000000000000000000000000005666856076ebaf477f07_bytes32};
     const evmc::bytes32 val3{0x4400000000000000000000000000000000000000000000000000000000000000_bytes32};
 
-    upsert_storage_value(table, key, loc1.bytes, val1.bytes);
-    upsert_storage_value(table, key, loc2.bytes, val2.bytes);
-    upsert_storage_value(table, key, loc3.bytes, val3.bytes);
+    if (table::use_psitri_optimized_plain_state()) {
+        upsert_flat_storage_value(state_table, key, loc1.bytes, val1.bytes);
+        upsert_flat_storage_value(state_table, key, loc2.bytes, val2.bytes);
+        upsert_flat_storage_value(state_table, key, loc3.bytes, val3.bytes);
+    } else {
+        upsert_storage_value(state_table, key, loc1.bytes, val1.bytes);
+        upsert_storage_value(state_table, key, loc2.bytes, val2.bytes);
+        upsert_storage_value(state_table, key, loc3.bytes, val3.bytes);
+    }
 
     CHECK(read_storage(txn, addr, kDefaultIncarnation, loc1) == val1);
     CHECK(read_storage(txn, addr, kDefaultIncarnation, loc2) == val2);

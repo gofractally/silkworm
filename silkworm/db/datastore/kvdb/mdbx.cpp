@@ -3,11 +3,142 @@
 
 #include "mdbx.hpp"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <string_view>
 
 #include <silkworm/infra/common/log.hpp>
 
 namespace silkworm::datastore::kvdb {
+
+namespace {
+
+struct TraceConfig {
+    FILE* file{nullptr};
+    std::string_view tables;
+    bool enabled{false};
+};
+
+TraceConfig& kv_trace_config() {
+    static TraceConfig config = [] {
+        TraceConfig cfg;
+        const char* path = std::getenv("SILKWORM_KV_TRACE");
+        if (!path || !*path) {
+            return cfg;
+        }
+
+        cfg.file = std::strcmp(path, "stderr") == 0 ? stderr : std::fopen(path, "a");
+        cfg.enabled = cfg.file != nullptr;
+        if (const char* tables = std::getenv("SILKWORM_KV_TRACE_TABLES")) {
+            cfg.tables = tables;
+        }
+        return cfg;
+    }();
+    return config;
+}
+
+bool kv_trace_table_enabled(std::string_view table) {
+    auto& cfg = kv_trace_config();
+    if (!cfg.enabled) {
+        return false;
+    }
+    if (cfg.tables.empty() || cfg.tables == "*") {
+        return true;
+    }
+
+    size_t pos = 0;
+    while (pos <= cfg.tables.size()) {
+        const size_t comma = cfg.tables.find(',', pos);
+        const auto token = cfg.tables.substr(pos, comma == std::string_view::npos ? cfg.tables.size() - pos : comma - pos);
+        if (token == table) {
+            return true;
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return false;
+}
+
+uint64_t kv_trace_hash(const void* data, size_t size) {
+    static constexpr uint64_t kOffset = 14695981039346656037ull;
+    static constexpr uint64_t kPrime = 1099511628211ull;
+    uint64_t hash = kOffset;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= kPrime;
+    }
+    return hash;
+}
+
+struct KvTraceSig {
+    bool present{false};
+    size_t size{0};
+    uint64_t hash{0};
+    const uint8_t* data{nullptr};
+};
+
+KvTraceSig kv_trace_sig(const Slice& slice) {
+    return {true, slice.length(), kv_trace_hash(slice.data(), slice.length()), static_cast<const uint8_t*>(slice.data())};
+}
+
+void kv_trace_print_sig(FILE* file, const char* name, const KvTraceSig& sig) {
+    if (!sig.present) {
+        std::fprintf(file, "\t%s=-", name);
+        std::fprintf(file, "\t%s_hex=-", name);
+        return;
+    }
+    std::fprintf(file, "\t%s=%zu:%016llx", name, sig.size, static_cast<unsigned long long>(sig.hash));
+    if (sig.size <= 64) {
+        std::fprintf(file, "\t%s_hex=", name);
+        for (size_t i = 0; i < sig.size; ++i) {
+            std::fprintf(file, "%02x", sig.data[i]);
+        }
+    } else {
+        std::fprintf(file, "\t%s_hex=...", name);
+    }
+}
+
+void kv_trace_event(std::string_view table, const char* op, int status,
+                    const KvTraceSig& in_key = {}, const KvTraceSig& in_value = {},
+                    const KvTraceSig& out_key = {}, const KvTraceSig& out_value = {},
+                    uint32_t flags = 0) {
+    if (!kv_trace_table_enabled(table)) {
+        return;
+    }
+
+    static std::atomic<uint64_t> sequence{0};
+    static std::mutex write_mutex;
+
+    auto& cfg = kv_trace_config();
+    std::lock_guard lock{write_mutex};
+    std::fprintf(cfg.file, "seq=%llu\top=%s\ttable=%.*s\tstatus=%d\tflags=%u",
+                 static_cast<unsigned long long>(sequence.fetch_add(1, std::memory_order_relaxed)),
+                 op, static_cast<int>(table.size()), table.data(), status, flags);
+    kv_trace_print_sig(cfg.file, "in_key", in_key);
+    kv_trace_print_sig(cfg.file, "in_value", in_value);
+    kv_trace_print_sig(cfg.file, "out_key", out_key);
+    kv_trace_print_sig(cfg.file, "out_value", out_value);
+    std::fputc('\n', cfg.file);
+    std::fflush(cfg.file);
+}
+
+void kv_trace_result(std::string_view table, const char* op, const CursorResult& result,
+                     const KvTraceSig& in_key = {}, const KvTraceSig& in_value = {},
+                     uint32_t flags = 0) {
+    const auto out_key = result.done ? kv_trace_sig(result.key) : KvTraceSig{};
+    const auto out_value = result.done ? kv_trace_sig(result.value) : KvTraceSig{};
+    kv_trace_event(table, op, result.done ? 1 : 0, in_key, in_value,
+                   out_key, out_value, flags);
+}
+
+}  // namespace
 
 namespace detail {
     std::string dump_mdbx_result(const CursorResult& result) {
@@ -319,10 +450,14 @@ PooledCursor::PooledCursor(ROTxn& txn, const MapConfig& config) {
     bind(txn, config);
 }
 
-PooledCursor::PooledCursor(PooledCursor&& other) noexcept { std::swap(handle_, other.handle_); }
+PooledCursor::PooledCursor(PooledCursor&& other) noexcept {
+    std::swap(handle_, other.handle_);
+    std::swap(map_name_, other.map_name_);
+}
 
 PooledCursor& PooledCursor::operator=(PooledCursor&& other) noexcept {
     std::swap(handle_, other.handle_);
+    std::swap(map_name_, other.map_name_);
     return *this;
 }
 
@@ -343,6 +478,9 @@ PooledCursor::~PooledCursor() {
 }
 
 void PooledCursor::bind(ROTxn& txn, ::mdbx::map_handle map) {
+    if (map_name_.empty()) {
+        map_name_ = std::to_string(map.dbi);
+    }
 #ifndef USE_PSITRI
     if (!handle_) throw std::runtime_error("cannot bind a closed cursor");
 #endif
@@ -368,6 +506,7 @@ void PooledCursor::bind(ROTxn& txn, ::mdbx::map_handle map) {
 }
 
 void PooledCursor::bind(::mdbx::txn& txn, const MapConfig& config) {
+    map_name_ = config.name_str();
 #ifndef USE_PSITRI
     if (!handle_) throw std::runtime_error("cannot bind a closed cursor");
 #endif
@@ -394,6 +533,7 @@ void PooledCursor::bind(::mdbx::txn& txn, const MapConfig& config) {
 }
 
 void PooledCursor::bind(ROTxn& txn, const MapConfig& config) {
+    map_name_ = config.name_str();
     bind(txn, txn.cached_map(config));
 }
 
@@ -436,71 +576,105 @@ size_t PooledCursor::size() const { return get_map_stat().ms_entries; }
 }
 
 CursorResult PooledCursor::to_first() {
-    return ::mdbx::cursor::to_first(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_first(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "first", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_first(bool throw_notfound) {
-    return ::mdbx::cursor::to_first(throw_notfound);
+    auto result = ::mdbx::cursor::to_first(throw_notfound);
+    kv_trace_result(map_name_, "first", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_previous() {
-    return ::mdbx::cursor::to_previous(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_previous(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "previous", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_previous(bool throw_notfound) {
-    return ::mdbx::cursor::to_previous(throw_notfound);
+    auto result = ::mdbx::cursor::to_previous(throw_notfound);
+    kv_trace_result(map_name_, "previous", result);
+    return result;
 }
 
 CursorResult PooledCursor::current() const {
-    return ::mdbx::cursor::current(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::current(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "current", result);
+    return result;
 }
 
 CursorResult PooledCursor::current(bool throw_notfound) const {
-    return ::mdbx::cursor::current(throw_notfound);
+    auto result = ::mdbx::cursor::current(throw_notfound);
+    kv_trace_result(map_name_, "current", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_next() {
-    return ::mdbx::cursor::to_next(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_next(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "next", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_next(bool throw_notfound) {
-    return ::mdbx::cursor::to_next(throw_notfound);
+    auto result = ::mdbx::cursor::to_next(throw_notfound);
+    kv_trace_result(map_name_, "next", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_last() {
-    return ::mdbx::cursor::to_last(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_last(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "last", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_last(bool throw_notfound) {
-    return ::mdbx::cursor::to_last(throw_notfound);
+    auto result = ::mdbx::cursor::to_last(throw_notfound);
+    kv_trace_result(map_name_, "last", result);
+    return result;
 }
 
 CursorResult PooledCursor::find(const Slice& key) {
-    return ::mdbx::cursor::find(key, /*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::find(key, /*throw_notfound =*/true);
+    kv_trace_result(map_name_, "find", result, kv_trace_sig(key));
+    return result;
 }
 
 CursorResult PooledCursor::find(const Slice& key, bool throw_notfound) {
-    return ::mdbx::cursor::find(key, throw_notfound);
+    auto result = ::mdbx::cursor::find(key, throw_notfound);
+    kv_trace_result(map_name_, "find", result, kv_trace_sig(key));
+    return result;
 }
 
 CursorResult PooledCursor::lower_bound(const Slice& key) {
-    return ::mdbx::cursor::lower_bound(key, /*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::lower_bound(key, /*throw_notfound =*/true);
+    kv_trace_result(map_name_, "lower_bound", result, kv_trace_sig(key));
+    return result;
 }
 
 CursorResult PooledCursor::lower_bound(const Slice& key, bool throw_notfound) {
-    return ::mdbx::cursor::lower_bound(key, throw_notfound);
+    auto result = ::mdbx::cursor::lower_bound(key, throw_notfound);
+    kv_trace_result(map_name_, "lower_bound", result, kv_trace_sig(key));
+    return result;
 }
 
 MoveResult PooledCursor::move(MoveOperation operation, bool throw_notfound) {
-    return ::mdbx::cursor::move(operation, throw_notfound);
+    auto result = ::mdbx::cursor::move(operation, throw_notfound);
+    kv_trace_result(map_name_, "move", result, {}, {}, static_cast<uint32_t>(operation));
+    return result;
 }
 
 MoveResult PooledCursor::move(MoveOperation operation, const Slice& key, bool throw_notfound) {
-    return ::mdbx::cursor::move(operation, key, throw_notfound);
+    auto result = ::mdbx::cursor::move(operation, key, throw_notfound);
+    kv_trace_result(map_name_, "move_key", result, kv_trace_sig(key), {}, static_cast<uint32_t>(operation));
+    return result;
 }
 
 bool PooledCursor::seek(const Slice& key) {
-    return ::mdbx::cursor::seek(key);
+    bool result = ::mdbx::cursor::seek(key);
+    kv_trace_event(map_name_, "seek", result ? 1 : 0, kv_trace_sig(key));
+    return result;
 }
 
 bool PooledCursor::eof() const {
@@ -516,116 +690,171 @@ bool PooledCursor::on_last() const {
 }
 
 CursorResult PooledCursor::to_previous_last_multi() {
-    return ::mdbx::cursor::to_previous_last_multi(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_previous_last_multi(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "previous_last_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_previous_last_multi(bool throw_notfound) {
-    return ::mdbx::cursor::to_previous_last_multi(throw_notfound);
+    auto result = ::mdbx::cursor::to_previous_last_multi(throw_notfound);
+    kv_trace_result(map_name_, "previous_last_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_first_multi() {
-    return ::mdbx::cursor::to_current_first_multi(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_current_first_multi(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "current_first_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_first_multi(bool throw_notfound) {
-    return ::mdbx::cursor::to_current_first_multi(throw_notfound);
+    auto result = ::mdbx::cursor::to_current_first_multi(throw_notfound);
+    kv_trace_result(map_name_, "current_first_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_prev_multi() {
-    return ::mdbx::cursor::to_current_prev_multi(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_current_prev_multi(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "current_prev_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_prev_multi(bool throw_notfound) {
-    return ::mdbx::cursor::to_current_prev_multi(throw_notfound);
+    auto result = ::mdbx::cursor::to_current_prev_multi(throw_notfound);
+    kv_trace_result(map_name_, "current_prev_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_next_multi() {
-    return ::mdbx::cursor::to_current_next_multi(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_current_next_multi(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "current_next_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_next_multi(bool throw_notfound) {
-    return ::mdbx::cursor::to_current_next_multi(throw_notfound);
+    auto result = ::mdbx::cursor::to_current_next_multi(throw_notfound);
+    kv_trace_result(map_name_, "current_next_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_last_multi() {
-    return ::mdbx::cursor::to_current_last_multi(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_current_last_multi(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "current_last_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_current_last_multi(bool throw_notfound) {
-    return ::mdbx::cursor::to_current_last_multi(throw_notfound);
+    auto result = ::mdbx::cursor::to_current_last_multi(throw_notfound);
+    kv_trace_result(map_name_, "current_last_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_next_first_multi() {
-    return ::mdbx::cursor::to_next_first_multi(/*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::to_next_first_multi(/*throw_notfound =*/true);
+    kv_trace_result(map_name_, "next_first_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::to_next_first_multi(bool throw_notfound) {
-    return ::mdbx::cursor::to_next_first_multi(throw_notfound);
+    auto result = ::mdbx::cursor::to_next_first_multi(throw_notfound);
+    kv_trace_result(map_name_, "next_first_multi", result);
+    return result;
 }
 
 CursorResult PooledCursor::find_multivalue(const Slice& key, const Slice& value) {
-    return ::mdbx::cursor::find_multivalue(key, value, /*throw_notfound =*/true);
+    auto result = ::mdbx::cursor::find_multivalue(key, value, /*throw_notfound =*/true);
+    kv_trace_result(map_name_, "find_multi", result, kv_trace_sig(key), kv_trace_sig(value));
+    return result;
 }
 
 CursorResult PooledCursor::find_multivalue(const Slice& key, const Slice& value, bool throw_notfound) {
-    return ::mdbx::cursor::find_multivalue(key, value, throw_notfound);
+    auto result = ::mdbx::cursor::find_multivalue(key, value, throw_notfound);
+    kv_trace_result(map_name_, "find_multi", result, kv_trace_sig(key), kv_trace_sig(value));
+    return result;
 }
 
 CursorResult PooledCursor::lower_bound_multivalue(const Slice& key, const Slice& value) {
-    return ::mdbx::cursor::lower_bound_multivalue(key, value, /*throw_notfound =*/false);
+    auto result = ::mdbx::cursor::lower_bound_multivalue(key, value, /*throw_notfound =*/false);
+    kv_trace_result(map_name_, "lower_bound_multi", result, kv_trace_sig(key), kv_trace_sig(value));
+    return result;
 }
 
 CursorResult PooledCursor::lower_bound_multivalue(const Slice& key, const Slice& value, bool throw_notfound) {
-    return ::mdbx::cursor::lower_bound_multivalue(key, value, throw_notfound);
+    auto result = ::mdbx::cursor::lower_bound_multivalue(key, value, throw_notfound);
+    kv_trace_result(map_name_, "lower_bound_multi", result, kv_trace_sig(key), kv_trace_sig(value));
+    return result;
 }
 
 MoveResult PooledCursor::move(MoveOperation operation, const Slice& key, const Slice& value, bool throw_notfound) {
-    return ::mdbx::cursor::move(operation, key, value, throw_notfound);
+    auto result = ::mdbx::cursor::move(operation, key, value, throw_notfound);
+    kv_trace_result(map_name_, "move_key_value", result, kv_trace_sig(key), kv_trace_sig(value),
+                    static_cast<uint32_t>(operation));
+    return result;
 }
 
 size_t PooledCursor::count_multivalue() const {
-    return ::mdbx::cursor::count_multivalue();
+    size_t result = ::mdbx::cursor::count_multivalue();
+    kv_trace_event(map_name_, "count_multi", static_cast<int>(result));
+    return result;
 }
 
 MDBX_error_t PooledCursor::put(const Slice& key, Slice* value, MDBX_put_flags_t flags) noexcept {
-    return ::mdbx::cursor::put(key, value, flags);
+    MDBX_error_t rc = ::mdbx::cursor::put(key, value, flags);
+    kv_trace_event(map_name_, "put", rc, kv_trace_sig(key), value ? kv_trace_sig(*value) : KvTraceSig{},
+                   {}, {}, static_cast<uint32_t>(flags));
+    return rc;
 }
 
 void PooledCursor::insert(const Slice& key, Slice value) {
     ::mdbx::cursor::insert(key, value);
+    kv_trace_event(map_name_, "insert", 0, kv_trace_sig(key), kv_trace_sig(value));
 }
 
 void PooledCursor::upsert(const Slice& key, const Slice& value) {
     ::mdbx::cursor::upsert(key, value);
+    kv_trace_event(map_name_, "upsert", 0, kv_trace_sig(key), kv_trace_sig(value));
 }
 
 void PooledCursor::update(const Slice& key, const Slice& value) {
     ::mdbx::cursor::update(key, value);
+    kv_trace_event(map_name_, "update", 0, kv_trace_sig(key), kv_trace_sig(value));
 }
 
 void PooledCursor::append(const Slice& key, const Slice& value) {
     Slice value_out = value;
     ::mdbx::error::success_or_throw(::mdbx::cursor::put(key, &value_out, MDBX_put_flags_t::MDBX_APPENDDUP));
+    kv_trace_event(map_name_, "append", 0, kv_trace_sig(key), kv_trace_sig(value_out),
+                   {}, {}, static_cast<uint32_t>(MDBX_APPENDDUP));
 }
 
 bool PooledCursor::erase() {
-    return ::mdbx::cursor::erase(/*whole_multivalue =*/false);
+    bool result = ::mdbx::cursor::erase(/*whole_multivalue =*/false);
+    kv_trace_event(map_name_, "erase_current", result ? 1 : 0);
+    return result;
 }
 
 bool PooledCursor::erase(bool whole_multivalue) {
-    return ::mdbx::cursor::erase(whole_multivalue);
+    bool result = ::mdbx::cursor::erase(whole_multivalue);
+    kv_trace_event(map_name_, whole_multivalue ? "erase_current_all" : "erase_current", result ? 1 : 0);
+    return result;
 }
 
 bool PooledCursor::erase(const Slice& key) {
-    return ::mdbx::cursor::erase(key, /*whole_multivalue =*/true);
+    bool result = ::mdbx::cursor::erase(key, /*whole_multivalue =*/true);
+    kv_trace_event(map_name_, "erase_key_all", result ? 1 : 0, kv_trace_sig(key));
+    return result;
 }
 
 bool PooledCursor::erase(const Slice& key, bool whole_multivalue) {
-    return ::mdbx::cursor::erase(key, whole_multivalue);
+    bool result = ::mdbx::cursor::erase(key, whole_multivalue);
+    kv_trace_event(map_name_, whole_multivalue ? "erase_key_all" : "erase_key", result ? 1 : 0, kv_trace_sig(key));
+    return result;
 }
 
 bool PooledCursor::erase(const Slice& key, const Slice& value) {
-    return ::mdbx::cursor::erase(key, value);
+    bool result = ::mdbx::cursor::erase(key, value);
+    kv_trace_event(map_name_, "erase_key_value", result ? 1 : 0, kv_trace_sig(key), kv_trace_sig(value));
+    return result;
 }
 
 bool has_map(::mdbx::txn& tx, std::string_view map_name) {

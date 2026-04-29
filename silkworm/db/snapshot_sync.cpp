@@ -3,12 +3,14 @@
 
 #include "snapshot_sync.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <exception>
 #include <stdexcept>
 #include <utility>
 
 #include <boost/asio/this_coro.hpp>
+#include <boost/system/system_error.hpp>
 #include <gsl/util>
 #include <magic_enum.hpp>
 
@@ -75,6 +77,7 @@ SnapshotSync::SnapshotSync(
 Task<void> SnapshotSync::run() {
     using namespace concurrency::awaitable_wait_for_all;
 
+    stop_requested_.store(false, std::memory_order_relaxed);
     [[maybe_unused]] auto _ = gsl::finally([this]() { this->is_stopping_latch_.count_down(); });
 
     if (!settings_.enabled) {
@@ -97,6 +100,10 @@ Task<void> SnapshotSync::run() {
         }
         throw;
     }
+}
+
+void SnapshotSync::request_stop() {
+    stop_requested_.store(true, std::memory_order_relaxed);
 }
 
 Task<void> SnapshotSync::setup_and_run() {
@@ -139,7 +146,12 @@ Task<void> SnapshotSync::setup() {
 
     // Update chain and stage progresses in database according to available snapshots
     datastore::kvdb::RWTxnManaged rw_txn = data_store_.chaindata.access_rw().start_rw_tx();
-    update_database(rw_txn, blocks_repository().max_timestamp_available(), [this] { return is_stopping_latch_.try_wait(); });
+    const BlockNum max_block_available{blocks_repository().max_timestamp_available()};
+    const auto stop_at_block = Environment::get_stop_at_block();
+    const BlockNum max_block_to_update{stop_at_block ? std::min(max_block_available, *stop_at_block) : max_block_available};
+    update_database(rw_txn, max_block_to_update, [this] {
+        return stop_requested_.load(std::memory_order_relaxed) || is_stopping_latch_.try_wait();
+    });
     rw_txn.commit_and_stop();
 
     if (!settings_.no_seeding) {
@@ -336,6 +348,11 @@ void SnapshotSync::update_block_headers(RWTxn& txn, BlockNum max_block_available
     }
 
     SILK_INFO << "SnapshotSync: database update started";
+    auto throw_if_stopping = [&is_stopping]() {
+        if (is_stopping()) {
+            throw boost::system::system_error{make_error_code(boost::system::errc::operation_canceled)};
+        }
+    };
 
     // Iterate on block header snapshots and write header-related tables
     datastore::kvdb::Collector hash_to_block_num_collector;
@@ -343,6 +360,7 @@ void SnapshotSync::update_block_headers(RWTxn& txn, BlockNum max_block_available
     auto canonical_hashes_cursor = txn.rw_cursor(table::kCanonicalHashes);
     intx::uint256 total_difficulty{0};
     uint64_t block_count{0};
+    throw_if_stopping();
 
     for (const auto& bundle_ptr : blocks_repository().view_bundles()) {
         db::blocks::BundleDataRef bundle{**bundle_ptr};
@@ -370,10 +388,11 @@ void SnapshotSync::update_block_headers(RWTxn& txn, BlockNum max_block_available
             endian::store_big_u64(encoded_block_num.data(), block_num);
             hash_to_block_num_collector.collect({std::move(block_hash_bytes), std::move(encoded_block_num)});
 
-            if (++block_count % 1'000'000 == 0) {
+            ++block_count;
+            if (block_count % 1'000'000 == 0) {
                 SILK_INFO << "SnapshotSync: processing block header=" << block_num << " count=" << block_count;
-                if (is_stopping()) return;
             }
+            if (block_count % 10'000 == 0) throw_if_stopping();
         }
     }
 
@@ -387,12 +406,10 @@ void SnapshotSync::update_block_headers(RWTxn& txn, BlockNum max_block_available
     write_head_header_hash(txn, *canonical_hash);
     SILK_INFO << "SnapshotSync: database table HeadHeader updated";
 
-    // Update Headers stage progress to the max block in snapshots (w/ STOP_AT_BLOCK support)
-    const auto stop_at_block = Environment::get_stop_at_block();
-    const BlockNum stage_progress{stop_at_block ? *stop_at_block : max_block_available};
-    stages::write_stage_progress(txn, stages::kHeadersKey, stage_progress);
+    // Update Headers stage progress to the effective max block.
+    stages::write_stage_progress(txn, stages::kHeadersKey, max_block_available);
 
-    SILK_INFO << "SnapshotSync: database Headers stage progress updated [" << stage_progress << "]";
+    SILK_INFO << "SnapshotSync: database Headers stage progress updated [" << max_block_available << "]";
 }
 
 void SnapshotSync::update_block_bodies(RWTxn& txn, BlockNum max_block_available) {
@@ -409,12 +426,10 @@ void SnapshotSync::update_block_bodies(RWTxn& txn, BlockNum max_block_available)
     reset_map_sequence(txn, table::kBlockTransactions.name, last_tx_id + 1);
     SILK_INFO << "SnapshotSync: database table BlockTransactions sequence reset";
 
-    // Update BlockBodies stage progress to the max block in snapshots (w/ STOP_AT_BLOCK support)
-    const auto stop_at_block = Environment::get_stop_at_block();
-    const BlockNum stage_progress{stop_at_block ? *stop_at_block : max_block_available};
-    stages::write_stage_progress(txn, stages::kBlockBodiesKey, stage_progress);
+    // Update BlockBodies stage progress to the effective max block.
+    stages::write_stage_progress(txn, stages::kBlockBodiesKey, max_block_available);
 
-    SILK_INFO << "SnapshotSync: database BlockBodies stage progress updated [" << stage_progress << "]";
+    SILK_INFO << "SnapshotSync: database BlockBodies stage progress updated [" << max_block_available << "]";
 }
 
 void SnapshotSync::update_block_hashes(RWTxn& txn, BlockNum max_block_available) {
@@ -424,12 +439,10 @@ void SnapshotSync::update_block_hashes(RWTxn& txn, BlockNum max_block_available)
         return;
     }
 
-    // Update BlockHashes stage progress to the max block in snapshots (w/ STOP_AT_BLOCK support)
-    const auto stop_at_block = Environment::get_stop_at_block();
-    const BlockNum stage_progress{stop_at_block ? *stop_at_block : max_block_available};
-    stages::write_stage_progress(txn, stages::kBlockHashesKey, stage_progress);
+    // Update BlockHashes stage progress to the effective max block.
+    stages::write_stage_progress(txn, stages::kBlockHashesKey, max_block_available);
 
-    SILK_INFO << "SnapshotSync: database BlockHashes stage progress updated [" << stage_progress << "]";
+    SILK_INFO << "SnapshotSync: database BlockHashes stage progress updated [" << max_block_available << "]";
 }
 
 void SnapshotSync::update_block_senders(RWTxn& txn, BlockNum max_block_available) {
@@ -439,12 +452,10 @@ void SnapshotSync::update_block_senders(RWTxn& txn, BlockNum max_block_available
         return;
     }
 
-    // Update Senders stage progress to the max block in snapshots (w/ STOP_AT_BLOCK support)
-    const auto stop_at_block = Environment::get_stop_at_block();
-    const BlockNum stage_progress{stop_at_block ? *stop_at_block : max_block_available};
-    stages::write_stage_progress(txn, stages::kSendersKey, stage_progress);
+    // Update Senders stage progress to the effective max block.
+    stages::write_stage_progress(txn, stages::kSendersKey, max_block_available);
 
-    SILK_INFO << "SnapshotSync: database Senders stage progress updated [" << stage_progress << "]";
+    SILK_INFO << "SnapshotSync: database Senders stage progress updated [" << max_block_available << "]";
 }
 
 }  // namespace silkworm::db

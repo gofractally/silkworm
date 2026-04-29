@@ -29,6 +29,7 @@
 #include <silkworm/db/genesis.hpp>
 #include <silkworm/db/snapshot_sync.hpp>
 #include <silkworm/db/stages.hpp>
+#include <silkworm/db/util.hpp>
 #include <silkworm/infra/cli/common.hpp>
 #include <silkworm/infra/common/directories.hpp>
 #include <silkworm/infra/common/ensure.hpp>
@@ -713,7 +714,7 @@ void reset_to_download(const kvdb::EnvConfig& config, const bool keep_senders, c
     source.bind(*txn, db::table::kHashedCodeHash);
     txn->clear_map(source.map());
     SILK_INFO_M(db::stages::kHashStateKey, {"table", db::table::kHashedStorage.name_str()}) << "truncating ...";
-    source.bind(*txn, db::table::kHashedStorage);
+    source.bind(*txn, db::table::hashed_storage_config());
     txn->clear_map(source.map());
     SILK_INFO_M(db::stages::kHashStateKey, {"table", db::table::kHashedAccounts.name_str()}) << "truncating ...";
     source.bind(*txn, db::table::kHashedAccounts);
@@ -762,7 +763,7 @@ void reset_to_download(const kvdb::EnvConfig& config, const bool keep_senders, c
     source.bind(*txn, db::table::kCallTraceSet);
     txn->clear_map(source.map());
     SILK_INFO_M(db::stages::kExecutionKey, {"table", db::table::kPlainState.name_str()}) << "truncating ...";
-    source.bind(*txn, db::table::kPlainState);
+    source.bind(*txn, db::table::plain_state_config());
     txn->clear_map(source.map());
     txn.commit_and_renew();
 
@@ -912,7 +913,7 @@ void trie_integrity(kvdb::EnvConfig& config, bool with_state_coverage, bool cont
             source = std::string(db::table::kTrieOfStorage.name);
             trie_cursor1.bind(txn, db::table::kTrieOfStorage);
             trie_cursor2.bind(txn, db::table::kTrieOfStorage);
-            state_cursor.bind(txn, db::table::kHashedStorage);
+            state_cursor.bind(txn, db::table::hashed_storage_config());
             prefix_len = db::kHashedStoragePrefixLength;
         }
 
@@ -1151,15 +1152,22 @@ void trie_integrity(kvdb::EnvConfig& config, bool with_state_coverage, bool cont
                             throw std::runtime_error(what);
                         }
                     } else {
-                        // On second loop we search HashedStorage (which is dup-sorted)
-                        auto data3{state_cursor.lower_bound_multivalue(kvdb::to_slice(data1_k.substr(0, prefix_len)),
-                                                                       kvdb::to_slice(seek), false)};
+                        // On second loop we search HashedStorage.
+                        const bool optimized_hashed_storage{db::table::use_psitri_optimized_hashed_storage()};
+                        const Bytes flat_seek{
+                            optimized_hashed_storage ? db::storage_key(data1_k.substr(0, prefix_len), seek) : Bytes{}};
+                        auto data3{optimized_hashed_storage
+                                       ? state_cursor.lower_bound(kvdb::to_slice(flat_seek), false)
+                                       : state_cursor.lower_bound_multivalue(kvdb::to_slice(data1_k.substr(0, prefix_len)),
+                                                                             kvdb::to_slice(seek), false)};
                         if (data3) {
-                            auto data3_v{kvdb::from_slice(data3.value)};
-                            if (data3_v.size() >= fixed_bytes) {
+                            auto data3_storage_key{
+                                optimized_hashed_storage ? kvdb::from_slice(data3.key).substr(prefix_len)
+                                                         : kvdb::from_slice(data3.value)};
+                            if (data3_storage_key.size() >= fixed_bytes) {
                                 found = (bits_to_match == 0 ||
-                                         ((data3_v.substr(0, fixed_bytes - 1) == seek.substr(0, fixed_bytes - 1)) &&
-                                          ((data3_v[fixed_bytes - 1] & mask) == (seek[fixed_bytes - 1] & mask))));
+                                         ((data3_storage_key.substr(0, fixed_bytes - 1) == seek.substr(0, fixed_bytes - 1)) &&
+                                          ((data3_storage_key[fixed_bytes - 1] & mask) == (seek[fixed_bytes - 1] & mask))));
                             }
                         }
                         if (!found) {

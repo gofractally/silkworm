@@ -3,6 +3,7 @@
 
 #include "util.hpp"
 
+#include <array>
 #include <cstring>
 #include <stdexcept>
 
@@ -17,6 +18,45 @@ namespace silkworm::db {
 using datastore::kvdb::from_slice;
 using datastore::kvdb::to_slice;
 
+namespace {
+
+struct FlatStorageKey {
+    std::array<uint8_t, kHashedStoragePrefixLength + kLocationLength> bytes{};
+    size_t size{0};
+
+    ByteView view() const { return {bytes.data(), size}; }
+};
+
+FlatStorageKey make_flat_storage_key(ByteView storage_prefix, ByteView location) {
+    SILKWORM_ASSERT(location.size() <= kLocationLength);
+    SILKWORM_ASSERT(storage_prefix.size() + location.size() <= kHashedStoragePrefixLength + kLocationLength);
+
+    FlatStorageKey key;
+    key.size = storage_prefix.size() + location.size();
+    if (!storage_prefix.empty()) {
+        std::memcpy(key.bytes.data(), storage_prefix.data(), storage_prefix.size());
+    }
+    if (!location.empty()) {
+        std::memcpy(key.bytes.data() + storage_prefix.size(), location.data(), location.size());
+    }
+    return key;
+}
+
+FlatStorageKey make_plain_storage_key(const evmc::address& address, uint64_t incarnation, ByteView location) {
+    SILKWORM_ASSERT(location.size() <= kLocationLength);
+
+    FlatStorageKey key;
+    key.size = kPlainStoragePrefixLength + location.size();
+    std::memcpy(key.bytes.data(), address.bytes, kAddressLength);
+    endian::store_big_u64(key.bytes.data() + kAddressLength, incarnation);
+    if (!location.empty()) {
+        std::memcpy(key.bytes.data() + kPlainStoragePrefixLength, location.data(), location.size());
+    }
+    return key;
+}
+
+}  // namespace
+
 Bytes storage_prefix(ByteView address, uint64_t incarnation) {
     SILKWORM_ASSERT(address.size() == kAddressLength || address.size() == kHashLength);
     Bytes res(address.size() + kIncarnationLength, '\0');
@@ -27,6 +67,17 @@ Bytes storage_prefix(ByteView address, uint64_t incarnation) {
 
 Bytes storage_prefix(const evmc::address& address, uint64_t incarnation) {
     return storage_prefix(address.bytes, incarnation);
+}
+
+Bytes storage_key(ByteView storage_prefix, ByteView location) {
+    Bytes res(storage_prefix.size() + location.size(), '\0');
+    if (!storage_prefix.empty()) {
+        std::memcpy(&res[0], storage_prefix.data(), storage_prefix.size());
+    }
+    if (!location.empty()) {
+        std::memcpy(&res[storage_prefix.size()], location.data(), location.size());
+    }
+    return res;
 }
 
 Bytes composite_storage_key(const evmc::address& address, uint64_t incarnation, HashAsArray hash) {
@@ -183,6 +234,59 @@ void upsert_storage_value(datastore::kvdb::RWCursorDupSort& state_cursor, ByteVi
         std::memcpy(&new_db_value[location.size()], new_value.data(), new_value.size());
         state_cursor.upsert(to_slice(storage_prefix), to_slice(new_db_value));
     }
+}
+
+std::optional<ByteView> find_flat_storage_value(datastore::kvdb::ROCursor& table, ByteView storage_prefix, ByteView location) {
+    const auto key{make_flat_storage_key(storage_prefix, location)};
+    auto data{table.find(to_slice(key.view()), /*throw_notfound=*/false)};
+    if (!data) {
+        return std::nullopt;
+    }
+    return from_slice(data.value);
+}
+
+std::optional<ByteView> find_flat_storage_value(datastore::kvdb::ROCursor& table, const evmc::address& address,
+                                                uint64_t incarnation, ByteView location) {
+    const auto key{make_plain_storage_key(address, incarnation, location)};
+    auto data{table.find(to_slice(key.view()), /*throw_notfound=*/false)};
+    if (!data) {
+        return std::nullopt;
+    }
+    return from_slice(data.value);
+}
+
+datastore::kvdb::CursorResult lower_bound_flat_storage(
+    datastore::kvdb::ROCursor& table,
+    ByteView storage_prefix,
+    ByteView location_prefix,
+    bool throw_notfound) {
+    const auto key{make_flat_storage_key(storage_prefix, location_prefix)};
+    auto data{table.lower_bound(to_slice(key.view()), throw_notfound)};
+    if (!data || !from_slice(data.key).starts_with(storage_prefix)) {
+        return {};
+    }
+    return data;
+}
+
+void upsert_flat_storage_value(datastore::kvdb::RWCursor& state_cursor, ByteView storage_prefix, ByteView location, ByteView new_value) {
+    const auto key{make_flat_storage_key(storage_prefix, location)};
+    new_value = zeroless_view(new_value);
+    if (new_value.empty()) {
+        state_cursor.erase(to_slice(key.view()));
+        return;
+    }
+    state_cursor.upsert(to_slice(key.view()), to_slice(new_value));
+}
+
+void upsert_flat_storage_value(datastore::kvdb::RWCursor& state_cursor, const evmc::address& address,
+                               uint64_t incarnation, ByteView location, ByteView new_value) {
+    const auto key{make_plain_storage_key(address, incarnation, location)};
+    new_value = zeroless_view(new_value);
+    if (new_value.empty()) {
+        state_cursor.erase(to_slice(key.view()));
+        return;
+    }
+    state_cursor.upsert(to_slice(key.view()), to_slice(new_value));
 }
 
 Bytes account_domain_key(const evmc::address& address) {

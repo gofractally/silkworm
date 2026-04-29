@@ -28,6 +28,7 @@ class Node {
     Node& operator=(const Node&) = delete;
 
     Task<void> run();
+    void request_stop();
     Task<void> wait_for_setup();
 
   private:

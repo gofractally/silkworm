@@ -5,6 +5,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <boost/system/system_error.hpp>
+
 #include <silkworm/core/chain/config.hpp>
 #include <silkworm/db/blocks/bodies/body_index.hpp>
 #include <silkworm/db/blocks/headers/header_index.hpp>
@@ -124,25 +126,34 @@ TEST_CASE("SnapshotSync::update_block_headers", "[db][snapshot][sync]") {
     SnapshotBundle bundle = repository.open_bundle(step_range);
     repository.add_snapshot_bundle(std::move(bundle));
 
-    // Update the block headers in the database according to the repository content
     auto& tmp_db = test.context;
     BlockNum max_block_available = header_segment_file.block_num_range().end - 1;
-    auto is_stopping = [] { return false; };
-    CHECK_NOTHROW(snapshot_sync.update_block_headers(tmp_db.rw_txn(), max_block_available, is_stopping));
 
-    // Expect that the database is correctly populated (N.B. cannot check Difficulty table because of sample snapshots)
-    auto block_is_in_header_numbers = [&](Hash block_hash, BlockNum expected_block_num) {
-        const auto block_num = db::read_block_num(tmp_db.rw_txn(), block_hash);
-        return block_num == expected_block_num;
-    };
-    auto block_is_canonical = [&](BlockNum block_num, Hash expected_block_hash) {
-        const auto canonical_block_hash = db::read_canonical_header_hash(tmp_db.rw_txn(), block_num);
-        return canonical_block_hash == expected_block_hash;
-    };
+    SECTION("honors stop request") {
+        auto is_stopping = [] { return true; };
+        CHECK_THROWS_AS(snapshot_sync.update_block_headers(tmp_db.rw_txn(), max_block_available, is_stopping),
+                        boost::system::system_error);
+    }
 
-    const Hash block_1500013_hash{0xbef48d7de01f2d7ea1a7e4d1ed401f73d6d0257a364f6770b25ba51a123ac35f_bytes32};
-    CHECK(block_is_in_header_numbers(block_1500013_hash, 1'500'013));
-    CHECK(block_is_canonical(1'500'013, block_1500013_hash));
+    SECTION("updates block headers") {
+        // Update the block headers in the database according to the repository content
+        auto is_stopping = [] { return false; };
+        CHECK_NOTHROW(snapshot_sync.update_block_headers(tmp_db.rw_txn(), max_block_available, is_stopping));
+
+        // Expect that the database is correctly populated (N.B. cannot check Difficulty table because of sample snapshots)
+        auto block_is_in_header_numbers = [&](Hash block_hash, BlockNum expected_block_num) {
+            const auto block_num = db::read_block_num(tmp_db.rw_txn(), block_hash);
+            return block_num == expected_block_num;
+        };
+        auto block_is_canonical = [&](BlockNum block_num, Hash expected_block_hash) {
+            const auto canonical_block_hash = db::read_canonical_header_hash(tmp_db.rw_txn(), block_num);
+            return canonical_block_hash == expected_block_hash;
+        };
+
+        const Hash block_1500013_hash{0xbef48d7de01f2d7ea1a7e4d1ed401f73d6d0257a364f6770b25ba51a123ac35f_bytes32};
+        CHECK(block_is_in_header_numbers(block_1500013_hash, 1'500'013));
+        CHECK(block_is_canonical(1'500'013, block_1500013_hash));
+    }
 }
 
 }  // namespace silkworm::db

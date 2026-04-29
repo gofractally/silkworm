@@ -23,9 +23,9 @@ enum Operation {
 std::pair<MapConfig, MapConfig> get_tables_for_checking(Operation operation) {
     switch (operation) {
         case kHashAccount:
-            return {table::kPlainState, table::kHashedAccounts};
+            return {table::plain_state_config(), table::kHashedAccounts};
         case kHashStorage:
-            return {table::kPlainState, table::kHashedStorage};
+            return {table::plain_state_config(), table::hashed_storage_config()};
         default:
             return {table::kPlainCodeHash, table::kHashedCodeHash};
     }
@@ -63,20 +63,50 @@ void check(mdbx::txn& txn, Operation operation) {
 
         } else if (operation == kHashStorage) {
             // Storage
-            if (data.key.length() != kAddressLength) {
+            const bool optimized_plain_state{table::use_psitri_optimized_plain_state()};
+            const bool optimized_hashed_storage{table::use_psitri_optimized_hashed_storage()};
+            const size_t expected_key_length{optimized_plain_state ? kPlainStoragePrefixLength + kHashLength
+                                                                   : kPlainStoragePrefixLength};
+            if (data.key.length() != expected_key_length) {
                 data = source_table.to_next(false);
                 continue;
             }
 
-            Bytes key(kHashLength * 2 + kIncarnationLength, '\0');
+            auto data_value_view{from_slice(data.value)};
+            if (!optimized_plain_state && data_value_view.size() < kHashLength) {
+                SILK_ERROR << "Storage value too short: key=" << to_hex(mdb_key_as_bytes)
+                           << ", value=" << to_hex(data_value_view);
+                return;
+            }
+
+            Bytes key(kHashLength + kIncarnationLength, '\0');
             std::memcpy(&key[0], keccak256(mdb_key_as_bytes.substr(0, kAddressLength)).bytes, kHashLength);
             std::memcpy(&key[kHashLength], &mdb_key_as_bytes[kAddressLength], kIncarnationLength);
-            std::memcpy(&key[kHashLength + kIncarnationLength],
-                        keccak256(mdb_key_as_bytes.substr(kAddressLength + kIncarnationLength)).bytes, kHashLength);
 
-            auto target_data{target_table.find_multivalue(to_slice(key), data.value, /*throw_notfound*/ false)};
+            const ByteView location{optimized_plain_state
+                                        ? ByteView{mdb_key_as_bytes}.substr(kPlainStoragePrefixLength, kHashLength)
+                                        : data_value_view.substr(0, kHashLength)};
+            const ByteView expected_payload{optimized_plain_state
+                                                ? data_value_view
+                                                : data_value_view.substr(kHashLength)};
+
+            Bytes value(kHashLength + expected_payload.size(), '\0');
+            std::memcpy(&value[0], keccak256(location).bytes, kHashLength);
+            if (!expected_payload.empty()) {
+                std::memcpy(&value[kHashLength], expected_payload.data(), expected_payload.size());
+            }
+
+            auto target_data{optimized_hashed_storage
+                                 ? target_table.find(to_slice(storage_key(key, value.substr(0, kHashLength))), false)
+                                 : target_table.find_multivalue(to_slice(key), to_slice(value), /*throw_notfound*/ false)};
             if (!target_data) {
-                SILK_ERROR << "Key: " << to_hex(key) << ", does not exist.";
+                SILK_ERROR << "Storage key/value does not exist: key=" << to_hex(key)
+                           << ", value=" << to_hex(value);
+                return;
+            }
+            if (optimized_hashed_storage && target_data.value != to_slice(expected_payload)) {
+                SILK_ERROR << "Expected: " << to_hex(value.substr(kHashLength)) << ", Actual: << "
+                           << to_hex(from_slice(target_data.value));
                 return;
             }
             data = source_table.to_next(false);

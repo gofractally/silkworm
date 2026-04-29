@@ -10,6 +10,7 @@
 
 #include <silkworm/core/common/bytes_to_string.hpp>
 #include <silkworm/db/test_util/temp_chain_data.hpp>
+#include <silkworm/db/util.hpp>
 
 static const std::map<std::string, std::string> kGeneticCode{
     {"AAA", "Lysine"},
@@ -81,6 +82,7 @@ static const std::map<std::string, std::string> kGeneticCode{
 namespace silkworm::datastore::kvdb {
 
 using namespace silkworm::db;
+using namespace evmc::literals;
 
 TEST_CASE("Environment opening") {
     SECTION("Default page size on creation") {
@@ -669,6 +671,73 @@ TEST_CASE("OF pages") {
         CHECK_THROWS_AS(target.insert(to_slice(key), to_slice(value)), ::mdbx::exception);
     }
 #endif  // NDEBUG
+}
+
+TEST_CASE("Flat storage helpers") {
+    test_util::TempChainData context;
+    RWTxn& txn = context.rw_txn();
+
+    static constexpr std::string_view kTableName{"FlatStorage"};
+    PooledCursor target(txn, {kTableName});
+
+    Bytes prefix(40, 0x11);
+    prefix[39] = 1;
+
+    Bytes location1(32, '\0');
+    location1[31] = 1;
+    Bytes location2(32, '\0');
+    location2[31] = 2;
+
+    const Bytes value1{0x00, 0x00, 0x12};
+    const Bytes value2{0x34, 0x56};
+    const Bytes expected_value1{0x12};
+
+    upsert_flat_storage_value(target, prefix, location2, value2);
+    upsert_flat_storage_value(target, prefix, location1, value1);
+
+    const auto found1{find_flat_storage_value(target, prefix, location1)};
+    REQUIRE(found1.has_value());
+    CHECK(found1.value() == ByteView{expected_value1});
+
+    const auto lower_bound{
+        lower_bound_flat_storage(target, prefix, ByteView{location1.data(), 1}, /*throw_notfound=*/false)};
+    REQUIRE(lower_bound);
+    CHECK(from_slice(lower_bound.key) == ByteView{storage_key(prefix, location1)});
+    CHECK(from_slice(lower_bound.value) == ByteView{expected_value1});
+
+    upsert_flat_storage_value(target, prefix, location1, ByteView{});
+    CHECK(!find_flat_storage_value(target, prefix, location1).has_value());
+
+    const evmc::address address{0xbe00000000000000000000000000000000000000_address};
+    const Bytes expected_value2{0x34, 0x56};
+    upsert_flat_storage_value(target, address, kDefaultIncarnation, location2, value2);
+    const auto found2{find_flat_storage_value(target, address, kDefaultIncarnation, location2)};
+    REQUIRE(found2.has_value());
+    CHECK(found2.value() == ByteView{expected_value2});
+}
+
+TEST_CASE("HashedStorage layout config") {
+    const auto config{table::hashed_storage_config()};
+    CHECK(config.name == table::kHashedStorageName);
+#ifdef USE_PSITRI
+    const auto expected_mode{table::use_psitri_optimized_hashed_storage() ? mdbx::value_mode::single
+                                                                          : mdbx::value_mode::multi};
+#else
+    const auto expected_mode{mdbx::value_mode::multi};
+#endif
+    CHECK(config.value_mode == expected_mode);
+}
+
+TEST_CASE("PlainState layout config") {
+    const auto config{table::plain_state_config()};
+    CHECK(config.name == table::kPlainStateName);
+#ifdef USE_PSITRI
+    const auto expected_mode{table::use_psitri_optimized_plain_state() ? mdbx::value_mode::single
+                                                                       : mdbx::value_mode::multi};
+#else
+    const auto expected_mode{mdbx::value_mode::multi};
+#endif
+    CHECK(config.value_mode == expected_mode);
 }
 
 static uint64_t get_free_pages(const ::mdbx::env& env) {

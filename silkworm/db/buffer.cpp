@@ -4,6 +4,8 @@
 #include "buffer.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 
 #include <absl/container/btree_set.h>
@@ -22,6 +24,26 @@ namespace silkworm::db {
 
 using datastore::kvdb::to_slice;
 
+namespace {
+
+bool is_traced_bad_gas_address(const evmc::address& address) {
+    static constexpr uint8_t kAddress[]{
+        0x60, 0x62, 0xe4, 0x66, 0xcf, 0x33, 0xa5, 0xd1, 0xe2, 0x2a,
+        0xc5, 0x7b, 0x2a, 0x72, 0x6a, 0x23, 0xbf, 0x79, 0xa0, 0xd0};
+    return std::memcmp(address.bytes, kAddress, sizeof(kAddress)) == 0;
+}
+
+bool is_traced_bad_gas_code_hash(const evmc::bytes32& code_hash) {
+    static constexpr uint8_t kCodeHash[]{
+        0x24, 0x20, 0xae, 0x84, 0xd6, 0xa3, 0xb3, 0x64,
+        0x42, 0x08, 0x2a, 0x6e, 0xc0, 0xb5, 0x52, 0xb4,
+        0xdb, 0xe8, 0xbc, 0x64, 0xdd, 0x2a, 0x89, 0xa7,
+        0x2c, 0x4c, 0xa3, 0x2e, 0x64, 0x05, 0x56, 0x03};
+    return std::memcmp(code_hash.bytes, kCodeHash, sizeof(kCodeHash)) == 0;
+}
+
+}  // namespace
+
 void Buffer::reset_cached_cursors() const noexcept {
     plain_state_cursor_.reset();
     plain_code_hash_cursor_.reset();
@@ -39,10 +61,10 @@ void Buffer::ensure_cached_cursors_current() const {
     cached_cursor_txn_id_ = txn_id;
 }
 
-datastore::kvdb::ROCursorDupSort& Buffer::plain_state_cursor() const {
+datastore::kvdb::ROCursor& Buffer::plain_state_cursor() const {
     ensure_cached_cursors_current();
     if (!plain_state_cursor_) {
-        plain_state_cursor_ = txn_.ro_cursor_dup_sort(table::kPlainState);
+        plain_state_cursor_ = txn_.ro_cursor(table::plain_state_config());
     }
     return *plain_state_cursor_;
 }
@@ -148,6 +170,16 @@ void Buffer::update_account(const evmc::address& address, std::optional<Account>
         accounts_[address] = current;
     }
 
+    if (is_traced_bad_gas_address(address)) {
+        SILK_ERROR_M("PsiTriStateTrace",
+                     {"write", "update-account",
+                      "address", to_hex(address.bytes, true),
+                      "present", current ? "1" : "0",
+                      "nonce", current ? std::to_string(current->nonce) : "",
+                      "incarnation", current ? std::to_string(current->incarnation) : "",
+                      "code_hash", current ? to_hex(current->code_hash.bytes, true) : ""});
+    }
+
     const bool initial_smart_now_deleted{account_deleted && initial->incarnation};
     const bool initial_smart_now_eoa{!account_deleted && current->incarnation == 0 && initial && initial->incarnation};
     if (initial_smart_now_deleted || initial_smart_now_eoa) {
@@ -159,12 +191,27 @@ void Buffer::update_account(const evmc::address& address, std::optional<Account>
 
 void Buffer::update_account_code(const evmc::address& address, uint64_t incarnation, const evmc::bytes32& code_hash,
                                  ByteView code) {
+    if (code_hash != kEmptyHash && code.empty()) {
+        throw std::logic_error{"db::Buffer::update_account_code empty code for non-empty code hash"};
+    }
+
     // Don't overwrite existing code so that views of it that were previously returned by read_code are still valid
     const auto [inserted_or_existing_it, inserted] = hash_to_code_.try_emplace(code_hash, code);
     if (inserted) {
         batch_state_size_ += kHashLength + code.size();
     } else {
         batch_state_size_ += code.size() - inserted_or_existing_it->second.size();
+    }
+
+    if (is_traced_bad_gas_address(address) || is_traced_bad_gas_code_hash(code_hash)) {
+        SILK_ERROR_M("PsiTriStateTrace",
+                     {"write", "update-account-code",
+                      "address", to_hex(address.bytes, true),
+                      "incarnation", std::to_string(incarnation),
+                      "code_hash", to_hex(code_hash.bytes, true),
+                      "size", std::to_string(code.size()),
+                      "inserted", inserted ? "1" : "0",
+                      "cached_size", std::to_string(inserted_or_existing_it->second.size())});
     }
 
     if (storage_prefix_to_code_hash_.insert_or_assign(storage_prefix(address, incarnation), code_hash).second) {
@@ -333,6 +380,7 @@ void Buffer::write_history_to_db(bool write_change_sets) {
         log::Trace("Flushed history",
                    {"size", human_size(total_written_size), "in", StopWatch::format(sw.since_start(finish_time))});
     }
+    batch_txn_write_size_ += total_written_size;
     batch_history_size_ = 0;
 }
 
@@ -371,6 +419,12 @@ void Buffer::write_state_to_db() {
     if (!hash_to_code_.empty()) {
         auto code_table{open_cursor(txn_, table::kCode)};
         for (const auto& entry : hash_to_code_) {
+            if (is_traced_bad_gas_code_hash(entry.first)) {
+                SILK_ERROR_M("PsiTriStateTrace",
+                             {"write", "flush-code",
+                              "code_hash", to_hex(entry.first.bytes, true),
+                              "size", std::to_string(entry.second.size())});
+            }
             code_table.upsert(to_slice(entry.first), to_slice(entry.second));
             written_size += kHashLength + entry.second.size();
         }
@@ -386,6 +440,12 @@ void Buffer::write_state_to_db() {
     if (!storage_prefix_to_code_hash_.empty()) {
         auto code_hash_table{open_cursor(txn_, table::kPlainCodeHash)};
         for (const auto& entry : storage_prefix_to_code_hash_) {
+            if (is_traced_bad_gas_code_hash(entry.second)) {
+                SILK_ERROR_M("PsiTriStateTrace",
+                             {"write", "flush-plain-code-hash",
+                              "key", to_hex(entry.first, true),
+                              "code_hash", to_hex(entry.second.bytes, true)});
+            }
             code_hash_table.upsert(to_slice(entry.first), to_slice(entry.second));
             written_size += kAddressLength + kIncarnationLength + kHashLength;
         }
@@ -412,11 +472,25 @@ void Buffer::write_state_to_db() {
         log::Trace("Sorted addresses", {"in", StopWatch::format(duration)});
     }
 
-    auto state_table = txn_.rw_cursor_dup_sort(table::kPlainState);
+    const bool optimized_plain_state{table::use_psitri_optimized_plain_state()};
+    std::unique_ptr<datastore::kvdb::RWCursor> state_table;
+    if (optimized_plain_state) {
+        state_table = txn_.rw_cursor(table::plain_state_config());
+    } else {
+        state_table = txn_.rw_cursor_dup_sort(table::plain_state_config());
+    }
+    auto* state_table_dup = optimized_plain_state ? nullptr : dynamic_cast<datastore::kvdb::RWCursorDupSort*>(state_table.get());
+    if (!optimized_plain_state && !state_table_dup) {
+        throw std::logic_error("PlainState cursor does not support multivalue operations");
+    }
     for (const auto& address : addresses) {
         if (auto it{accounts_.find(address)}; it != accounts_.end()) {
             auto key{to_slice(address)};
-            state_table->erase(key, /*whole_multivalue=*/true);  // PlainState is multivalue
+            if (optimized_plain_state) {
+                state_table->erase(key);
+            } else {
+                state_table_dup->erase(key, /*whole_multivalue=*/true);  // PlainState is multivalue
+            }
             if (it->second.has_value()) {
                 Bytes encoded = state::AccountCodec::encode_for_storage(*it->second);
                 state_table->upsert(key, to_slice(encoded));
@@ -427,7 +501,10 @@ void Buffer::write_state_to_db() {
 
         if (auto it{storage_.find(address)}; it != storage_.end()) {
             for (const auto& [incarnation, contract_storage] : it->second) {
-                Bytes prefix{storage_prefix(address, incarnation)};
+                Bytes prefix;
+                if (!optimized_plain_state) {
+                    prefix = storage_prefix(address, incarnation);
+                }
                 // Extract sorted set of storage locations to insert ordered data into the DB
                 absl::btree_set<evmc::bytes32> storage_locations;
                 for (auto& storage_entry : contract_storage) {
@@ -436,8 +513,12 @@ void Buffer::write_state_to_db() {
                 for (const auto& location : storage_locations) {
                     if (auto storage_it{contract_storage.find(location)}; storage_it != contract_storage.end()) {
                         const auto& value{storage_it->second};
-                        upsert_storage_value(*state_table, prefix, location.bytes, value.bytes);
-                        written_size += prefix.size() + kLocationLength + zeroless_view(value.bytes).size();
+                        if (optimized_plain_state) {
+                            upsert_flat_storage_value(*state_table, address, incarnation, location.bytes, value.bytes);
+                        } else {
+                            upsert_storage_value(*state_table_dup, prefix, location.bytes, value.bytes);
+                        }
+                        written_size += kPlainStoragePrefixLength + kLocationLength + zeroless_view(value.bytes).size();
                     }
                 }
             }
@@ -451,6 +532,7 @@ void Buffer::write_state_to_db() {
                    {"size", human_size(written_size), "in", StopWatch::format(duration)});
     }
     batch_state_size_ = 0;
+    batch_txn_write_size_ = 0;
 
     auto [time_point, _]{sw.stop()};
     log::Info("Flushed state",
@@ -593,18 +675,41 @@ bool Buffer::read_body(uint64_t block_num, const evmc::bytes32& block_hash, Bloc
 
 std::optional<Account> Buffer::read_account(const evmc::address& address) const noexcept {
     if (auto it{accounts_.find(address)}; it != accounts_.end()) {
+        if (is_traced_bad_gas_address(address)) {
+            SILK_ERROR_M("PsiTriStateTrace",
+                         {"read", "account-cache",
+                          "address", to_hex(address.bytes, true),
+                          "present", it->second ? "1" : "0",
+                          "code_hash", it->second ? to_hex(it->second->code_hash.bytes, true) : ""});
+        }
         return it->second;
     }
     if (!historical_block_.has_value()) {
         auto& state_cursor{plain_state_cursor()};
         auto data{state_cursor.find(to_slice(address), /*throw_notfound=*/false)};
         if (!data.done || data.value.empty()) {
+            if (is_traced_bad_gas_address(address)) {
+                SILK_ERROR_M("PsiTriStateTrace",
+                             {"read", "account-db",
+                              "address", to_hex(address.bytes, true),
+                              "present", "0"});
+            }
             return std::nullopt;
         }
 
         auto acc_res{state::AccountCodec::from_encoded_storage(datastore::kvdb::from_slice(data.value))};
         silkworm::success_or_throw(acc_res);
         Account acc{*acc_res};
+        if (is_traced_bad_gas_address(address)) {
+            SILK_ERROR_M("PsiTriStateTrace",
+                         {"read", "account-db",
+                          "address", to_hex(address.bytes, true),
+                          "present", "1",
+                          "raw", to_hex(datastore::kvdb::from_slice(data.value), true),
+                          "nonce", std::to_string(acc.nonce),
+                          "incarnation", std::to_string(acc.incarnation),
+                          "code_hash", to_hex(acc.code_hash.bytes, true)});
+        }
 
         if (acc.incarnation > 0 && acc.code_hash == kEmptyHash) {
             auto& code_cursor{plain_code_hash_cursor()};
@@ -612,6 +717,19 @@ std::optional<Account> Buffer::read_account(const evmc::address& address) const 
             if (auto code_data = code_cursor.find(to_slice(key), /*throw_notfound=*/false);
                 code_data.done && code_data.value.length() == kHashLength) {
                 std::memcpy(acc.code_hash.bytes, code_data.value.data(), kHashLength);
+                if (is_traced_bad_gas_address(address)) {
+                    SILK_ERROR_M("PsiTriStateTrace",
+                                 {"read", "plain-code-hash",
+                                  "address", to_hex(address.bytes, true),
+                                  "incarnation", std::to_string(acc.incarnation),
+                                  "code_hash", to_hex(acc.code_hash.bytes, true)});
+                }
+            } else if (is_traced_bad_gas_address(address)) {
+                SILK_ERROR_M("PsiTriStateTrace",
+                             {"read", "plain-code-hash",
+                              "address", to_hex(address.bytes, true),
+                              "incarnation", std::to_string(acc.incarnation),
+                              "present", "0"});
             }
         }
 
@@ -622,18 +740,47 @@ std::optional<Account> Buffer::read_account(const evmc::address& address) const 
     return db_account;
 }
 
-ByteView Buffer::read_code(const evmc::address& /*address*/, const evmc::bytes32& code_hash) const noexcept {
+ByteView Buffer::read_code(const evmc::address& address, const evmc::bytes32& code_hash) const noexcept {
     if (auto it{hash_to_code_.find(code_hash)}; it != hash_to_code_.end()) {
+        if (is_traced_bad_gas_address(address)) {
+            SILK_ERROR_M("PsiTriStateTrace",
+                         {"read", "code-cache-new",
+                          "address", to_hex(address.bytes, true),
+                          "code_hash", to_hex(code_hash.bytes, true),
+                          "size", std::to_string(it->second.size())});
+        }
         return it->second;
     }
     if (auto it{existing_code_.find(code_hash)}; it != existing_code_.end()) {
+        if (is_traced_bad_gas_address(address)) {
+            SILK_ERROR_M("PsiTriStateTrace",
+                         {"read", "code-cache-existing",
+                          "address", to_hex(address.bytes, true),
+                          "code_hash", to_hex(code_hash.bytes, true),
+                          "size", std::to_string(it->second.size())});
+        }
         return it->second;
     }
     std::optional<Bytes> code{db::read_code(txn_, code_hash)};
     if (!code) {
+        if (is_traced_bad_gas_address(address)) {
+            SILK_ERROR_M("PsiTriStateTrace",
+                         {"read", "code-db",
+                          "address", to_hex(address.bytes, true),
+                          "code_hash", to_hex(code_hash.bytes, true),
+                          "present", "0"});
+        }
         return {};
     }
     auto [it, _]{existing_code_.emplace(code_hash, std::move(*code))};
+    if (is_traced_bad_gas_address(address)) {
+        SILK_ERROR_M("PsiTriStateTrace",
+                     {"read", "code-db",
+                      "address", to_hex(address.bytes, true),
+                      "code_hash", to_hex(code_hash.bytes, true),
+                      "present", "1",
+                      "size", std::to_string(it->second.size())});
+    }
     return it->second;
 }
 
@@ -647,8 +794,14 @@ evmc::bytes32 Buffer::read_storage(const evmc::address& address, uint64_t incarn
         }
     }
     if (!historical_block_.has_value()) {
-        auto key{storage_prefix(address, incarnation)};
-        auto value{find_value_suffix(plain_state_cursor(), key, location.bytes)};
+        std::optional<ByteView> value{};
+        auto& state_cursor{plain_state_cursor()};
+        if (table::use_psitri_optimized_plain_state()) {
+            value = find_flat_storage_value(state_cursor, address, incarnation, location.bytes);
+        } else if (auto* dup_cursor = dynamic_cast<datastore::kvdb::ROCursorDupSort*>(&state_cursor)) {
+            auto key{storage_prefix(address, incarnation)};
+            value = find_value_suffix(*dup_cursor, key, location.bytes);
+        }
         if (!value) {
             return {};
         }

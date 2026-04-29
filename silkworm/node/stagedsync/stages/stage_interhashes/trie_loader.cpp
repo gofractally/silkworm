@@ -43,7 +43,7 @@ evmc::bytes32 TrieLoader::calculate_root() {
     auto log_time{std::chrono::steady_clock::now()};
 
     auto hashed_accounts = txn_.ro_cursor(table::kHashedAccounts);
-    auto hashed_storage = txn_.ro_cursor_dup_sort(table::kHashedStorage);
+    auto hashed_storage = txn_.ro_cursor(table::hashed_storage_config());
     auto trie_accounts = txn_.ro_cursor(table::kTrieOfAccounts);
     auto trie_storage = txn_.ro_cursor(table::kTrieOfStorage);
 
@@ -140,37 +140,57 @@ evmc::bytes32 TrieLoader::calculate_root() {
 }
 
 evmc::bytes32 TrieLoader::calculate_storage_root(TrieCursor& trie_storage_cursor, HashBuilder& storage_hash_builder,
-                                                 ROCursorDupSort& hashed_storage, const Bytes& db_storage_prefix) {
+                                                 ROCursor& hashed_storage, const Bytes& db_storage_prefix) {
     using namespace std::chrono_literals;
     auto log_time{std::chrono::steady_clock::now()};
 
     static Bytes rlp_buffer{};
 
     const auto db_storage_prefix_slice{to_slice(db_storage_prefix)};
+    const bool optimized_hashed_storage{table::use_psitri_optimized_hashed_storage()};
     auto trie_storage_data{trie_storage_cursor.to_prefix(db_storage_prefix)};
     while (true) {
         if (trie_storage_data.first_uncovered.has_value()) {
             const auto prefix_slice{to_slice(trie_storage_data.first_uncovered.value())};
+            ROCursorDupSort* hashed_storage_dup{
+                optimized_hashed_storage ? nullptr : dynamic_cast<ROCursorDupSort*>(&hashed_storage)};
+            if (!optimized_hashed_storage && !hashed_storage_dup) {
+                throw std::logic_error("HashedStorage cursor does not support multivalue operations");
+            }
             auto hashed_storage_data{
-                hashed_storage.lower_bound_multivalue(db_storage_prefix_slice, prefix_slice, false)};
+                optimized_hashed_storage
+                    ? lower_bound_flat_storage(hashed_storage, db_storage_prefix, trie_storage_data.first_uncovered.value(), false)
+                    : hashed_storage_dup->lower_bound_multivalue(db_storage_prefix_slice, prefix_slice, false)};
 
             while (hashed_storage_data) {
                 if (const auto now{std::chrono::steady_clock::now()}; log_time <= now) {
                     SignalHandler::throw_if_signalled();
                 }
 
+                auto hashed_storage_key_view{from_slice(hashed_storage_data.key)};
                 auto hashed_storage_data_value_view{from_slice(hashed_storage_data.value)};
-                const auto nibbled_location{
-                    trie::unpack_nibbles(hashed_storage_data_value_view.substr(0, kHashLength))};
+                ByteView packed_location{};
+                if (optimized_hashed_storage) {
+                    if (!hashed_storage_key_view.starts_with(db_storage_prefix)) {
+                        break;
+                    }
+                    hashed_storage_key_view.remove_prefix(kHashedStoragePrefixLength);
+                    packed_location = hashed_storage_key_view.substr(0, kHashLength);
+                } else {
+                    packed_location = hashed_storage_data_value_view.substr(0, kHashLength);
+                    hashed_storage_data_value_view.remove_prefix(kHashLength);  // Keep value part
+                }
+
+                const auto nibbled_location{trie::unpack_nibbles(packed_location)};
                 if (trie_storage_data.key.has_value() && trie_storage_data.key.value() < nibbled_location) {
                     break;
                 }
 
-                hashed_storage_data_value_view.remove_prefix(kHashLength);  // Keep value part
                 rlp_buffer.clear();
                 rlp::encode(rlp_buffer, hashed_storage_data_value_view);
                 storage_hash_builder.add_leaf(nibbled_location, rlp_buffer);
-                hashed_storage_data = hashed_storage.to_current_next_multi(false);
+                hashed_storage_data = optimized_hashed_storage ? hashed_storage.to_next(false)
+                                                               : hashed_storage_dup->to_current_next_multi(false);
             }
         }
 

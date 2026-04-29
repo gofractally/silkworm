@@ -3,6 +3,7 @@
 
 #include "stage_hashstate.hpp"
 
+#include <memory>
 #include <stdexcept>
 
 #include <magic_enum.hpp>
@@ -164,7 +165,12 @@ Stage::Result HashState::hash_from_plainstate(RWTxn& txn) {
     Stage::Result ret{Stage::Result::kSuccess};
 
     try {
-        auto source = txn.ro_cursor_dup_sort(table::kPlainState);
+        const bool optimized_plain_state{table::use_psitri_optimized_plain_state()};
+        auto source = txn.ro_cursor(table::plain_state_config());
+        auto* source_dup = optimized_plain_state ? nullptr : dynamic_cast<datastore::kvdb::ROCursorDupSort*>(source.get());
+        if (!optimized_plain_state && !source_dup) {
+            throw std::logic_error("PlainState cursor does not support multivalue operations");
+        }
         auto data{source->to_first(/*throw_notfound=*/true)};
 
         /*
@@ -214,7 +220,7 @@ Stage::Result HashState::hash_from_plainstate(RWTxn& txn) {
 
                 Entry entry{Bytes(address_hash.bytes, kHashLength), Bytes{from_slice(data.value)}};
                 collector_->collect(std::move(entry));
-            } else if (data.key.length() == kPlainStoragePrefixLength) {
+            } else if (!optimized_plain_state && data.key.length() == kPlainStoragePrefixLength) {
                 // Hash storage
                 // data.key           == Address + Incarnation
                 // data.value (multi) == Location + zeroless Value
@@ -248,9 +254,27 @@ Stage::Result HashState::hash_from_plainstate(RWTxn& txn) {
                     data_value_view.remove_prefix(kHashLength);
                     Entry entry{etl_storage_entry_key, Bytes{data_value_view}};
                     collector_->collect(std::move(entry));
-                    data = source->to_current_next_multi(false);
+                    data = source_dup->to_current_next_multi(false);
                 }
 
+            } else if (optimized_plain_state && data.key.length() == kPlainStoragePrefixLength + kHashLength) {
+                // Hash storage
+                // data.key   == Address + Incarnation + Location
+                // data.value == zeroless Value
+                if (data.value.empty()) {
+                    const auto incarnation{endian::load_big_u64(&data_key_view[kAddressLength])};
+                    const std::string what("Unexpected empty value in PlainState for Account " + current_key_ +
+                                           " incarnation " + std::to_string(incarnation));
+                    throw StageError(Stage::Result::kUnexpectedError, what);
+                }
+
+                std::memcpy(&etl_storage_entry_key[0], address_hash.bytes, kHashLength);
+                std::memcpy(&etl_storage_entry_key[kHashLength], &data_key_view[kAddressLength],
+                            kIncarnationLength);
+                std::memcpy(&etl_storage_entry_key[kHashLength + kIncarnationLength],
+                            keccak256(data_key_view.substr(kPlainStoragePrefixLength, kHashLength)).bytes, kHashLength);
+                Entry entry{etl_storage_entry_key, Bytes{from_slice(data.value)}};
+                collector_->collect(std::move(entry));
             } else {
                 std::string what{"Unexpected key length " + std::to_string(data.key.length())};
                 throw StageError(Stage::Result::kUnexpectedError, what);
@@ -263,15 +287,25 @@ Stage::Result HashState::hash_from_plainstate(RWTxn& txn) {
 
         if (!collector_->empty()) {
             auto account_target = txn.rw_cursor_dup_sort(table::kHashedAccounts);  // note: not a multi-value table
-            auto storage_target = txn.rw_cursor_dup_sort(table::kHashedStorage);
+            const bool optimized_hashed_storage{table::use_psitri_optimized_hashed_storage()};
+            std::unique_ptr<datastore::kvdb::RWCursor> storage_target_flat{};
+            std::unique_ptr<datastore::kvdb::RWCursorDupSort> storage_target_dup{};
+            if (optimized_hashed_storage) {
+                storage_target_flat = txn.rw_cursor(table::hashed_storage_config());
+            } else {
+                storage_target_dup = txn.rw_cursor_dup_sort(table::hashed_storage_config());
+            }
 
             if (!account_target->empty())
                 throw std::runtime_error(std::string(table::kHashedAccounts.name) + " should be empty");
-            if (!storage_target->empty())
+            if (optimized_hashed_storage ? !storage_target_flat->empty() : !storage_target_dup->empty())
                 throw std::runtime_error(std::string(table::kHashedStorage.name) + " should be empty");
 
             // ETL key contains hashed location; for DB put we need to move it from key to value
-            const datastore::kvdb::LoadFunc load_func = [&storage_target](
+            const datastore::kvdb::LoadFunc load_func = [
+                                                            optimized_hashed_storage,
+                                                            &storage_target_flat,
+                                                            &storage_target_dup](
                                                             const Entry& entry,
                                                             datastore::kvdb::RWCursorDupSort& target,
                                                             MDBX_put_flags_t) -> void {
@@ -284,12 +318,18 @@ Stage::Result HashState::hash_from_plainstate(RWTxn& txn) {
                     mdbx::slice v{entry.value.data(), entry.value.size()};
                     mdbx::error::success_or_throw(target.put(k, &v, MDBX_APPEND));
                 } else if (entry.key.size() == kHashedStoragePrefixLength + kHashLength) {
-                    Bytes new_value(kHashLength + entry.value.size(), '\0');
-                    std::memcpy(&new_value[0], &entry.key[kHashedStoragePrefixLength], kHashLength);
-                    std::memcpy(&new_value[kHashLength], entry.value.data(), entry.value.size());
-                    mdbx::slice k{entry.key.data(), kHashedStoragePrefixLength};
-                    mdbx::slice v{new_value.data(), new_value.size()};
-                    mdbx::error::success_or_throw(storage_target->put(k, &v, MDBX_APPENDDUP));
+                    if (optimized_hashed_storage) {
+                        mdbx::slice k{entry.key.data(), entry.key.size()};
+                        mdbx::slice v{entry.value.data(), entry.value.size()};
+                        mdbx::error::success_or_throw(storage_target_flat->put(k, &v, MDBX_APPEND));
+                    } else {
+                        Bytes new_value(kHashLength + entry.value.size(), '\0');
+                        std::memcpy(&new_value[0], &entry.key[kHashedStoragePrefixLength], kHashLength);
+                        std::memcpy(&new_value[kHashLength], entry.value.data(), entry.value.size());
+                        mdbx::slice k{entry.key.data(), kHashedStoragePrefixLength};
+                        mdbx::slice v{new_value.data(), new_value.size()};
+                        mdbx::error::success_or_throw(storage_target_dup->put(k, &v, MDBX_APPENDDUP));
+                    }
                 } else {
                     std::string what{"Unexpected key length " + std::to_string(entry.key.size()) + " in PlainState"};
                     throw StageError(Stage::Result::kUnexpectedError, what);
@@ -417,7 +457,7 @@ Stage::Result HashState::hash_from_account_changeset(RWTxn& txn, BlockNum previo
 
         auto source_initial_key{block_key(expected_blocknum)};
         auto source_changeset = txn.ro_cursor_dup_sort(table::kAccountChangeSet);
-        auto source_plainstate = txn.ro_cursor_dup_sort(table::kPlainState);
+        auto source_plainstate = txn.ro_cursor(table::plain_state_config());
 
         // Initial record MUST be found because there is at least 1 change per block: the miner reward
         auto changeset_data = source_changeset->find(to_slice(source_initial_key), /*throw_notfound=*/true);
@@ -493,7 +533,12 @@ Stage::Result HashState::hash_from_storage_changeset(RWTxn& txn, BlockNum previo
         log_lck.unlock();
 
         auto source_changeset = txn.ro_cursor_dup_sort(table::kStorageChangeSet);
-        auto source_plainstate = txn.ro_cursor_dup_sort(table::kPlainState);
+        const bool optimized_plain_state{table::use_psitri_optimized_plain_state()};
+        auto source_plainstate = txn.ro_cursor(table::plain_state_config());
+        auto* source_plainstate_dup = optimized_plain_state ? nullptr : dynamic_cast<datastore::kvdb::ROCursorDupSort*>(source_plainstate.get());
+        if (!optimized_plain_state && !source_plainstate_dup) {
+            throw std::logic_error("PlainState cursor does not support multivalue operations");
+        }
 
         // find fist block with changes
         BlockNum initial_block{previous_progress + 1};
@@ -533,13 +578,18 @@ Stage::Result HashState::hash_from_storage_changeset(RWTxn& txn, BlockNum previo
                 storage_changes[address].insert_or_assign(incarnation, absl::btree_map<evmc::bytes32, Bytes>());
             }
 
-            Bytes plain_storage_prefix{storage_prefix(address, incarnation)};
+            Bytes plain_storage_prefix;
+            if (!optimized_plain_state) {
+                plain_storage_prefix = storage_prefix(address, incarnation);
+            }
 
             while (changeset_data.done) {
                 auto changeset_value_view{from_slice(changeset_data.value)};
                 auto location{to_bytes32(changeset_value_view)};
                 if (!storage_changes[address][incarnation].contains(location)) {
-                    auto plain_state_value{find_value_suffix(*source_plainstate, plain_storage_prefix, location.bytes)};
+                    auto plain_state_value{optimized_plain_state
+                                               ? find_flat_storage_value(*source_plainstate, address, incarnation, location.bytes)
+                                               : find_value_suffix(*source_plainstate_dup, plain_storage_prefix, location.bytes)};
                     storage_changes[address][incarnation].insert_or_assign(location,
                                                                            plain_state_value.value_or(Bytes()));
                 }
@@ -711,7 +761,10 @@ Stage::Result HashState::unwind_from_storage_changeset(RWTxn& txn, BlockNum prev
             changeset_key_view.remove_prefix(kAddressLength);
             const auto incarnation{endian::load_big_u64(changeset_key_view.data())};
             if (!incarnation) {
-                throw std::runtime_error("Unexpected EOA in StorageChangeset");
+                throw std::runtime_error(
+                    "Unexpected EOA in StorageChangeset block=" + std::to_string(reached_blocknum) +
+                    " address=" + address_to_hex(address) +
+                    " key=" + to_hex(from_slice(changeset_data.key), true));
             }
             if (!hashed_addresses.contains(address)) {
                 hashed_addresses[address] = to_bytes32(keccak256(address.bytes).bytes);
@@ -818,7 +871,14 @@ void HashState::write_changes_from_changed_storage(
     RWTxn& txn, StorageChanges& storage_changes,
     const absl::btree_map<evmc::address, evmc::bytes32>& hashed_addresses) {
     throw_if_stopping();
-    auto target_hashed_storage = txn.rw_cursor_dup_sort(table::kHashedStorage);
+    const bool optimized_hashed_storage{table::use_psitri_optimized_hashed_storage()};
+    std::unique_ptr<datastore::kvdb::RWCursor> target_hashed_storage_flat{};
+    std::unique_ptr<datastore::kvdb::RWCursorDupSort> target_hashed_storage_dup{};
+    if (optimized_hashed_storage) {
+        target_hashed_storage_flat = txn.rw_cursor(table::hashed_storage_config());
+    } else {
+        target_hashed_storage_dup = txn.rw_cursor_dup_sort(table::hashed_storage_config());
+    }
 
     std::unique_lock log_lck(log_mtx_);
     loading_ = true;
@@ -842,7 +902,11 @@ void HashState::write_changes_from_changed_storage(
             endian::store_big_u64(&hashed_storage_prefix[kHashLength], incarnation);
             for (const auto& [location, value] : data1) {
                 auto hashed_location{keccak256(location.bytes)};
-                upsert_storage_value(*target_hashed_storage, hashed_storage_prefix, hashed_location.bytes, value);
+                if (optimized_hashed_storage) {
+                    upsert_flat_storage_value(*target_hashed_storage_flat, hashed_storage_prefix, hashed_location.bytes, value);
+                } else {
+                    upsert_storage_value(*target_hashed_storage_dup, hashed_storage_prefix, hashed_location.bytes, value);
+                }
             }
         }
     }

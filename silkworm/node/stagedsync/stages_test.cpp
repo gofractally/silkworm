@@ -406,7 +406,7 @@ TEST_CASE("Sync Stages") {
         REQUIRE_NOTHROW(txn.commit_and_renew());
 
         // Check state after 3rd block in database
-        auto plain_state_cursor = txn.ro_cursor(table::kPlainState);
+        auto plain_state_cursor = txn.ro_cursor(table::plain_state_config());
         REQUIRE(plain_state_cursor->seek(to_slice(sender)));
         auto current_record = plain_state_cursor->current(/*throw_notfound=*/false);
         REQUIRE(current_record);
@@ -445,7 +445,7 @@ TEST_CASE("Sync Stages") {
             CHECK(storage0 == 0x000000000000000000000000000000000000000000000000000000000000003e_bytes32);
 
             // Check state after unwind of the 3rd block in database
-            plain_state_cursor = txn.ro_cursor(table::kPlainState);
+            plain_state_cursor = txn.ro_cursor(table::plain_state_config());
             REQUIRE(plain_state_cursor->seek(to_slice(sender)));
             current_record = plain_state_cursor->current(/*throw_notfound=*/false);
             REQUIRE(current_record);
@@ -483,7 +483,7 @@ TEST_CASE("Sync Stages") {
             stagedsync::Execution stage = make_execution_stage(&sync_context, node_settings, data_model_factory);
             REQUIRE(stage.unwind(txn) == stagedsync::Stage::Result::kSuccess);
 
-            plain_state_cursor = txn.ro_cursor(table::kPlainState);
+            plain_state_cursor = txn.ro_cursor(table::plain_state_config());
             REQUIRE(plain_state_cursor->seek(to_slice(sender)));
             current_record = plain_state_cursor->current(/*throw_notfound=*/false);
             REQUIRE(current_record);

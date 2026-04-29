@@ -747,7 +747,7 @@ std::optional<Account> read_account(ROTxn& txn, const evmc::address& address, st
     }
 
     if (!encoded.has_value()) {
-        auto state_cursor = txn.ro_cursor_dup_sort(table::kPlainState);
+        auto state_cursor = txn.ro_cursor(table::plain_state_config());
         if (auto data = state_cursor->find({address.bytes, sizeof(evmc::address)}, /*throw_notfound=*/false); data.done) {
             encoded.emplace(from_slice(data.value));
         }
@@ -780,9 +780,16 @@ evmc::bytes32 read_storage(ROTxn& txn, const evmc::address& address, uint64_t in
         val = historical_storage(txn, address, incarnation, location, block_num.value());
     }
     if (!val.has_value()) {
-        auto cursor = txn.ro_cursor_dup_sort(table::kPlainState);
-        auto key{storage_prefix(address, incarnation)};
-        auto value{find_value_suffix(*cursor, key, location.bytes)};
+        auto cursor = txn.ro_cursor(table::plain_state_config());
+        std::optional<ByteView> value{};
+        if (table::use_psitri_optimized_plain_state()) {
+            value = find_flat_storage_value(*cursor, address, incarnation, location.bytes);
+        } else if (auto* dup_cursor = dynamic_cast<ROCursorDupSort*>(cursor.get())) {
+            auto key{storage_prefix(address, incarnation)};
+            value = find_value_suffix(*dup_cursor, key, location.bytes);
+        } else {
+            throw std::logic_error("PlainState cursor does not support multivalue operations");
+        }
         if (value) {
             val.emplace(*value);
         }

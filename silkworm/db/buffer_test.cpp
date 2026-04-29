@@ -35,10 +35,25 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
 
     const evmc::bytes32 location_c{0x0000000000000000000000000000000000000000000000000000000000000003_bytes32};
 
-    auto state = txn.rw_cursor_dup_sort(table::kPlainState);
+    auto state = txn.rw_cursor_dup_sort(table::plain_state_config());
+    const bool optimized_plain_state{table::use_psitri_optimized_plain_state()};
 
-    upsert_storage_value(*state, key, location_a.bytes, value_a1.bytes);
-    upsert_storage_value(*state, key, location_b.bytes, value_b.bytes);
+    const auto upsert_test_storage = [&](ByteView location, ByteView value) {
+        if (optimized_plain_state) {
+            upsert_flat_storage_value(*state, key, location, value);
+        } else {
+            upsert_storage_value(*state, key, location, value);
+        }
+    };
+    const auto find_test_storage = [&](ByteView location) -> std::optional<ByteView> {
+        if (optimized_plain_state) {
+            return find_flat_storage_value(*state, key, location);
+        }
+        return find_value_suffix(*state, key, location);
+    };
+
+    upsert_test_storage(location_a.bytes, value_a1.bytes);
+    upsert_test_storage(location_b.bytes, value_b.bytes);
 
     Buffer buffer{txn, std::make_unique<BufferROTxDataModel>(txn)};
 
@@ -77,12 +92,12 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
         buffer.write_to_db();
 
         // Location A should have the new value
-        const std::optional<ByteView> db_value_a{find_value_suffix(*state, key, location_a.bytes)};
+        const std::optional<ByteView> db_value_a{find_test_storage(location_a.bytes)};
         REQUIRE(db_value_a.has_value());
         CHECK(db_value_a == zeroless_view(value_a2.bytes));
 
         // Location B should not change
-        const std::optional<ByteView> db_value_b{find_value_suffix(*state, key, location_b.bytes)};
+        const std::optional<ByteView> db_value_b{find_test_storage(location_b.bytes)};
         REQUIRE(db_value_b.has_value());
         CHECK(db_value_b == zeroless_view(value_b.bytes));
     }
@@ -162,7 +177,7 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
         const auto storage_changes3{read_storage_changes(txn, 3)};
         REQUIRE(storage_changes3.size() == 1);
 
-        const std::optional<ByteView> db_value_a2{find_value_suffix(*state, key, location_a.bytes)};
+        const std::optional<ByteView> db_value_a2{find_test_storage(location_a.bytes)};
         REQUIRE(db_value_a2.has_value());
         CHECK(db_value_a2 == zeroless_view(value_a2.bytes));
     }
@@ -177,7 +192,7 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
         CHECK(current_value_a1 == value_nil);
 
         // Not deleted from the db yet
-        const std::optional<ByteView> db_value_a1{find_value_suffix(*state, key, location_a.bytes)};
+        const std::optional<ByteView> db_value_a1{find_test_storage(location_a.bytes)};
         CHECK(db_value_a1.has_value());
         CHECK(db_value_a1 == zeroless_view(value_a1.bytes));
 
@@ -188,11 +203,11 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
         CHECK(current_value_a2 == value_nil);
 
         // Location A should be deleted
-        const std::optional<ByteView> db_value_a2{find_value_suffix(*state, key, location_a.bytes)};
+        const std::optional<ByteView> db_value_a2{find_test_storage(location_a.bytes)};
         CHECK(!db_value_a2.has_value());
 
         // Location B should not change
-        const std::optional<ByteView> db_value_b{find_value_suffix(*state, key, location_b.bytes)};
+        const std::optional<ByteView> db_value_b{find_test_storage(location_b.bytes)};
         REQUIRE(db_value_b.has_value());
         CHECK(db_value_b == zeroless_view(value_b.bytes));
     }
@@ -222,7 +237,7 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
 
         buffer.write_to_db();
 
-        const std::optional<ByteView> db_value_c1{find_value_suffix(*state, key, location_c.bytes)};
+        const std::optional<ByteView> db_value_c1{find_test_storage(location_c.bytes)};
         REQUIRE(db_value_c1.has_value());
         CHECK(db_value_c1 == zeroless_view(value_a1.bytes));
 
@@ -239,7 +254,7 @@ TEST_CASE("Buffer storage", "[silkworm][db][buffer]") {
 
         buffer.write_to_db();
 
-        const std::optional<ByteView> db_value_a1{find_value_suffix(*state, key, location_a.bytes)};
+        const std::optional<ByteView> db_value_a1{find_test_storage(location_a.bytes)};
         CHECK(!db_value_a1.has_value());
 
         auto current_value_a2{buffer.read_storage(address, kDefaultIncarnation, location_a)};
@@ -419,6 +434,43 @@ TEST_CASE("Buffer batch limit includes history payload", "[silkworm][db][buffer]
     CHECK_THROWS_AS(buffer.begin_block(2, 1), Buffer::MemoryLimitError);
 
     REQUIRE_NOTHROW(buffer.write_to_db());
+    CHECK(buffer.current_batch_state_size() == 0);
+    CHECK(buffer.current_batch_history_size() == 0);
+    CHECK(buffer.current_batch_size() == 0);
+}
+
+TEST_CASE("Buffer batch limit includes history already written into transaction", "[silkworm][db][buffer]") {
+    db::test_util::TempChainData context;
+    auto& txn{context.rw_txn()};
+
+    const evmc::address address{0xbe00000000000000000000000000000000000000_address};
+
+    Account initial_account;
+    initial_account.nonce = 1;
+    initial_account.balance = 0;
+
+    state::AccountEncodable current_account;
+    current_account.nonce = 2;
+    current_account.balance = kEther;
+
+    Buffer buffer{txn, std::make_unique<BufferROTxDataModel>(txn)};
+    buffer.begin_block(1, 1);
+    buffer.update_account(address, /*initial=*/initial_account, current_account);
+
+    const Bytes encoded_initial{state::AccountCodec::encode_for_storage(initial_account, /*omit_code_hash=*/true)};
+    const size_t expected_state_size{kAddressLength + current_account.encoding_length_for_storage()};
+    const size_t expected_history_size{sizeof(BlockNum) + kAddressLength + encoded_initial.size()};
+    const size_t expected_total_size{expected_state_size + expected_history_size};
+
+    REQUIRE_NOTHROW(buffer.write_history_to_db());
+    CHECK(buffer.current_batch_state_size() == expected_state_size);
+    CHECK(buffer.current_batch_history_size() == 0);
+    CHECK(buffer.current_batch_size() == expected_total_size);
+
+    buffer.set_memory_limit(expected_total_size - 1);
+    CHECK_THROWS_AS(buffer.begin_block(2, 1), Buffer::MemoryLimitError);
+
+    REQUIRE_NOTHROW(buffer.write_state_to_db());
     CHECK(buffer.current_batch_state_size() == 0);
     CHECK(buffer.current_batch_history_size() == 0);
     CHECK(buffer.current_batch_size() == 0);
