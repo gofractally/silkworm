@@ -109,6 +109,7 @@ class SilkwormRecipe(ConanFile):
 
             # silkworm requires:
             'iostreams',
+            'program_options',
             'system',
             'thread',
             'url',

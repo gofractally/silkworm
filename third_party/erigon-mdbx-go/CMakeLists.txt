@@ -22,6 +22,15 @@ if(USE_PSITRI)
 
   target_compile_definitions(psitrimdbx PUBLIC CONSTEXPR_ASSERT=assert USE_PSITRI=1)
 
+  # PsiTri skips standalone tools when embedded as a subdirectory, but the
+  # Silkworm stress-test checkout still needs the inspector/dashboard binary.
+  find_package(Boost REQUIRED COMPONENTS program_options)
+  add_executable(psitricorder "${PSITRI_DIR}/programs/psitri_tool.cpp")
+  target_link_libraries(psitricorder PUBLIC Boost::program_options psitri)
+  target_include_directories(psitricorder PUBLIC ${Boost_INCLUDE_DIRS})
+  set_target_properties(psitricorder PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 else()
   # ── Native libmdbx backend (default) ───────────────────────────────
 
