@@ -104,6 +104,7 @@ Task<void> SnapshotSync::run() {
 
 void SnapshotSync::request_stop() {
     stop_requested_.store(true, std::memory_order_relaxed);
+    client_.stop();
 }
 
 Task<void> SnapshotSync::setup_and_run() {

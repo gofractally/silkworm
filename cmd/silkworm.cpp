@@ -1,9 +1,12 @@
 // Copyright 2025 The Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <future>
 #include <memory>
 #include <optional>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,8 +24,6 @@
 #include <silkworm/infra/cli/common.hpp>
 #include <silkworm/infra/cli/shutdown_signal.hpp>
 #include <silkworm/infra/common/log.hpp>
-#include <silkworm/infra/concurrency/awaitable_wait_for_all.hpp>
-#include <silkworm/infra/concurrency/awaitable_wait_for_one.hpp>
 #include <silkworm/infra/grpc/client/client_context_pool.hpp>
 #include <silkworm/node/cli/node_options.hpp>
 #include <silkworm/node/node.hpp>
@@ -34,7 +35,6 @@ using namespace silkworm;
 using silkworm::BlockNum;
 using silkworm::DataDirectory;
 using silkworm::human_size;
-using silkworm::cmd::common::ShutdownSignal;
 
 const char* current_exception_name() {
 #ifdef WIN32
@@ -43,11 +43,6 @@ const char* current_exception_name() {
     int status{0};
     return abi::__cxa_demangle(abi::__cxa_current_exception_type()->name(), nullptr, nullptr, &status);
 #endif
-}
-
-Task<void> wait_for_shutdown_signal(node::Node& execution_node) {
-    co_await ShutdownSignal::wait();
-    execution_node.request_stop();
 }
 
 struct PruneModeValidator : public CLI::Validator {
@@ -204,11 +199,16 @@ void parse_silkworm_command_line(CLI::App& cli, int argc, char* argv[], node::Se
     settings.sentry_settings.network_id = node_settings.network_id;
 }
 
+Task<void> wait_for_shutdown_signal(node::Node& execution_node, std::atomic_bool& shutdown_requested) {
+    co_await cmd::common::ShutdownSignal::wait();
+    shutdown_requested.store(true, std::memory_order_relaxed);
+    SILK_INFO << "Shutdown signal observed; stopping Silkworm";
+    execution_node.request_stop();
+}
+
 // main
 int main(int argc, char* argv[]) {
     using namespace std::chrono;
-    using namespace silkworm::concurrency::awaitable_wait_for_one;
-    using namespace silkworm::concurrency::awaitable_wait_for_all;
 
     std::set_terminate([]() {
         try {
@@ -240,6 +240,7 @@ int main(int argc, char* argv[]) {
         silkworm::rpc::ClientContextPool context_pool{
             settings.server_settings.context_pool_settings,
         };
+        std::atomic_bool shutdown_requested{false};
 
         silkworm::node::Node execution_node{
             context_pool,
@@ -248,14 +249,46 @@ int main(int argc, char* argv[]) {
 
         // Go!
         auto run_future = boost::asio::co_spawn(
+            context_pool.any_executor(), execution_node.run(), boost::asio::use_future);
+        auto signal_future = boost::asio::co_spawn(
             context_pool.any_executor(),
-            execution_node.run() || wait_for_shutdown_signal(execution_node),
+            wait_for_shutdown_signal(execution_node, shutdown_requested),
             boost::asio::use_future);
         context_pool.start();
         SILK_INFO << "Silkworm is now running";
 
         // Wait for shutdown signal or an exception from tasks
-        run_future.get();
+        std::exception_ptr run_exception;
+        try {
+            run_future.get();
+        } catch (...) {
+            run_exception = std::current_exception();
+        }
+
+        execution_node.request_stop();
+        context_pool.stop();
+        context_pool.join();
+
+        if (signal_future.wait_for(seconds{0}) == std::future_status::ready) {
+            try {
+                signal_future.get();
+            } catch (const boost::system::system_error& ex) {
+                if (ex.code() != boost::system::errc::operation_canceled) {
+                    throw;
+                }
+            }
+        }
+
+        if (run_exception) {
+            try {
+                std::rethrow_exception(run_exception);
+            } catch (const boost::system::system_error& ex) {
+                if (!shutdown_requested.load(std::memory_order_relaxed) ||
+                    ex.code() != boost::system::errc::operation_canceled) {
+                    throw;
+                }
+            }
+        }
 
         // Graceful exit after user shutdown signal
         SILK_INFO << "Exiting Silkworm";
