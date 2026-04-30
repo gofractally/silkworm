@@ -382,6 +382,8 @@ struct EnvConfig {
     size_t growth_size{2_Gibi};         // Increment size for each extension
     uint32_t max_tables{256};           // Default max number of named tables
     uint32_t max_readers{100};          // Default max number of readers
+    size_t psitri_cache_size{8_Gibi};   // PsiTri pinned read-cache budget
+    uint32_t psitri_cache_window_sec{5 * 60 * 60};  // PsiTri read-cache sampling window
 };
 
 //! \brief EnvUnmanaged wraps an *unmanaged* MDBX environment, which means the underlying environment

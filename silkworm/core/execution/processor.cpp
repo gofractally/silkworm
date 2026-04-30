@@ -270,6 +270,11 @@ void ExecutionProcessor::execute_transaction(const Transaction& txn, Receipt& re
             if (m.code) {
                 state_.create_contract(m.addr, eip7702::is_code_delegated(*m.code));
                 state_.set_code(m.addr, *m.code);
+            } else if (rev < EVMC_PRAGUE && !m.modified_storage.empty()) {
+                const auto* obj = state_.get_object(m.addr);
+                if (obj == nullptr || !obj->current || obj->current->incarnation == 0) {
+                    state_.create_contract(m.addr, false);
+                }
             }
 
             auto& acc = state_.get_or_create_object(m.addr);

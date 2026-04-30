@@ -286,6 +286,12 @@ static mdbx::cursor::move_operation move_operation(CursorMoveDirection direction
     op.durability = OP::durability_from_flags(static_cast<MDBX_env_flags_t>(flags));
     op.max_maps = config.max_tables;
     op.max_readers = config.max_readers;
+#ifdef USE_PSITRI
+    op.psitri_cache_size_mb = (config.psitri_cache_size + 1_Mebi - 1) / 1_Mebi;
+    op.psitri_cache_window_sec = config.psitri_cache_window_sec;
+    SILK_INFO << "PsiTri read cache configured: size=" << human_size(config.psitri_cache_size)
+              << " window=" << config.psitri_cache_window_sec << "s";
+#endif
 
     ::mdbx::env_managed env{env_path.native(), cp, op, config.shared};
 

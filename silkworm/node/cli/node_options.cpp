@@ -33,6 +33,17 @@ void add_node_options(CLI::App& cli, NodeSettings& settings) {
         32_Mebi, 128_Tebi,
         "Chaindata database max size.");
 
+#ifdef USE_PSITRI
+    add_option_human_size(
+        cli, "--psitri.cache.size", settings.chaindata_env_config.psitri_cache_size,
+        0, 128_Gibi,
+        "PsiTri pinned read-cache budget.");
+    cli.add_option("--psitri.cache.window", settings.chaindata_env_config.psitri_cache_window_sec,
+                   "PsiTri read-cache sampling window in seconds")
+        ->capture_default_str()
+        ->check(CLI::Range(1u, 7u * 24u * 60u * 60u));
+#endif
+
     add_option_human_size(
         cli, "--batchsize", settings.batch_size,
         64_Mebi, 16_Gibi,
